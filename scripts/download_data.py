@@ -3,7 +3,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # Define destination path relative to the root directory
-ROOT_DIR = Path(__file__).resolve().parent  # Navigate to the root directory
+ROOT_DIR = Path(__file__).resolve().parent.parent  # Navigate to the root directory
 DATA_DIR = ROOT_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
