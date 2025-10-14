@@ -1,4 +1,3 @@
-readme_content = """
 # TI-RADS-NeuralNET
 
 This repository contains the implementation of a Vision Transformer (ViT)-based neural network for classifying thyroid nodules according to the TI-RADS composition categories. The project mirrors the research described in the following article:
