@@ -4,6 +4,7 @@
 # Hard-coded params, single train/test split.
 
 import os
+os.environ.setdefault("MPLBACKEND", "Agg")  # headless rendering
 from pathlib import Path
 import random
 
@@ -19,15 +20,20 @@ from torchvision import transforms
 from timm import create_model
 from sklearn.metrics import accuracy_score, confusion_matrix, ConfusionMatrixDisplay
 from tqdm import tqdm
-import matplotlib.pyplot as plt
+import matplotlib
+try:
+    matplotlib.use("Agg")  # belt + suspenders
+except Exception:
+    pass
 
+import matplotlib.pyplot as plt  # safe to import now
 # ----------------------
 # Hard-coded parameters
 # ----------------------
 SEED = 42
 IMAGE_SIZE = 224
 BATCH_SIZE = 8
-EPOCHS = 3
+EPOCHS = 25
 LR = 3e-5
 TEST_FRAC = 0.2
 MODEL_NAME = "vit_tiny_patch16_224"  # use vit_base_patch16_224 on GPU
@@ -167,18 +173,27 @@ def evaluate_with_preds(model, loader, device):
 # Plotting
 # ----------------------
 def plot_training_curves(losses, accs, out_path):
-    epochs = np.arange(1, len(losses) + 1)
-    plt.figure()
-    plt.plot(epochs, losses, label="Train Loss")
-    plt.plot(epochs, accs, label="Train Acc")
-    plt.xlabel("Epoch")
-    plt.ylabel("Value")
-    plt.title("Training Curves")
-    plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
+    """Safe, headless plotting of training curves (won't crash training)."""
+    try:
+        epochs = np.arange(1, len(losses) + 1)
+        plt.figure()
+        plt.plot(epochs, losses, label="Train Loss")
+        plt.plot(epochs, accs, label="Train Acc")
+        plt.xlabel("Epoch")
+        plt.ylabel("Value")
+        plt.title("Training Curves")
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150)
+    except Exception as e:
+        # don't let plotting kill the run
+        print(f"[WARN] Failed to plot training curves to {out_path}: {e}")
+    finally:
+        try:
+            plt.close()
+        except Exception:
+            pass
 
 def plot_conf_mat(gts, preds, classes, out_path):
     cm = confusion_matrix(gts, preds, labels=classes)
