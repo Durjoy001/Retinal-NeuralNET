@@ -32,15 +32,23 @@ def download_with_progress(url, dest_path):
     progress_bar.close()
 
 try:
-    # Download dataset with progress
-    print(f"📦 Downloading dataset from {dataset_url} ...")
-    download_with_progress(dataset_url, dataset_dest_path)
-    print(f"✅ Download complete! Saved to {dataset_dest_path.resolve()}")
+    # Check if dataset already exists
+    if dataset_dest_path.exists():
+        print(f"✅ Dataset already exists at {dataset_dest_path.resolve()}")
+    else:
+        # Download dataset with progress
+        print(f"📦 Downloading dataset from {dataset_url} ...")
+        download_with_progress(dataset_url, dataset_dest_path)
+        print(f"✅ Download complete! Saved to {dataset_dest_path.resolve()}")
 
-    # Download metadata with progress
-    print(f"📦 Downloading metadata from {metadata_url} ...")
-    download_with_progress(metadata_url, metadata_dest_path)
-    print(f"✅ Download complete! Saved to {metadata_dest_path.resolve()}")
+    # Check if metadata already exists
+    if metadata_dest_path.exists():
+        print(f"✅ Metadata already exists at {metadata_dest_path.resolve()}")
+    else:
+        # Download metadata with progress
+        print(f"📦 Downloading metadata from {metadata_url} ...")
+        download_with_progress(metadata_url, metadata_dest_path)
+        print(f"✅ Download complete! Saved to {metadata_dest_path.resolve()}")
 
 except Exception as e:
     print(f"❌ Failed to download files: {e}")
