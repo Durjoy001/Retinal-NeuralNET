@@ -8,11 +8,11 @@ DATA_DIR = ROOT_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Dataset URL and destination
-dataset_url = "http://berrypidrive.duckdns.org:8080/api/public/dl/vtTkh8rl/dataset.hdf5"
+dataset_url = "http://berrypidrive.duckdns.org:8000/api/public/dl/vtTkh8rl/dataset.hdf5"
 dataset_dest_path = DATA_DIR / "thyroid_dataset.h5"
 
 # Metadata URL and destination
-metadata_url = "http://berrypidrive.duckdns.org:8080/api/public/dl/vtTkh8rl/metadata.csv"
+metadata_url = "http://berrypidrive.duckdns.org:8000/api/public/dl/vtTkh8rl/metadata.csv"
 metadata_dest_path = DATA_DIR / "metadata.csv"
 
 def download_with_progress(url, dest_path):
