@@ -1,0 +1,3 @@
+epoch,train_loss,train_acc,train_sens,train_spec,val_loss,val_acc,val_sens,val_spec,val_auc
+1,0.230898,0.933809,0.033907,0.941412,0.087679,0.973471,0.022964,0.980328,nan
+2,0.087926,0.974230,0.040610,0.984936,0.076832,0.976529,0.034864,0.980189,nan
