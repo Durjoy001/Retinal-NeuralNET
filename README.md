@@ -4,6 +4,8 @@ This repository contains the implementation of a Vision Transformer (ViT)-based 
 
 [**"Research Article on Thyroid Nodule Classification"**](https://www.sciencedirect.com/science/article/pii/S1877050924031235)
 [**"Research Article 2"**](https://dl.acm.org/doi/pdf/10.1145/3731763.3731793)
+[**"Retinal Fundus Multi-Disease Image Dataset (RFMiD): A Dataset for Multi-Disease Detection Research"**](https://ieee-dataport.org/open-access/retinal-fundus-multi-disease-image-dataset-rfmid)
+[**"Comparative Analysis of Vision Transformers and Conventional Convolutional Neural Networks in Detecting Referable Diabetic Retinopathy"**](https://pubmed.ncbi.nlm.nih.gov/39165694/)
 
 ---
 
