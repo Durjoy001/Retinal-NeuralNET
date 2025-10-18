@@ -3,7 +3,7 @@
 This repository contains the implementation of a Vision Transformer (ViT)-based neural network for classifying thyroid nodules according to the TI-RADS composition categories. The project mirrors the research described in the following article:
 
 [**"Research Article on Thyroid Nodule Classification"**](https://www.sciencedirect.com/science/article/pii/S1877050924031235)
-[**"Research Article 2"**](https://dl.acm.org/doi/pdf/10.1145/3731763.3731793)
+[**"Evaluating the Performance and Clinical Applications of Multiclass Deep Learning Models for Skin Cancer Pathology Diagnosis (ISIC): A Comparative Analysis of CNN, ViT, and VLM"**](https://dl.acm.org/doi/10.1145/3731763.3731793)
 [**"Retinal Fundus Multi-Disease Image Dataset (RFMiD): A Dataset for Multi-Disease Detection Research"**](https://ieee-dataport.org/open-access/retinal-fundus-multi-disease-image-dataset-rfmid)
 [**"Comparative Analysis of Vision Transformers and Conventional Convolutional Neural Networks in Detecting Referable Diabetic Retinopathy"**](https://pubmed.ncbi.nlm.nih.gov/39165694/)
 
