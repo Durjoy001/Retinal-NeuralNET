@@ -224,9 +224,15 @@ def evaluate_model(model, loader, criterion, device, thresholds=None):
     avg_spec_per_class = np.mean(all_spec_per_class, axis=0)
     
     try:
-        auc_score = roc_auc_score(all_labels, all_preds, average='macro')
+        # Compute AUC only for valid classes
+        valid_cols = (np.sum(all_labels, axis=0) > 0) & (np.sum(all_labels == 0, axis=0) > 0)
+        if np.any(valid_cols):
+            auc_score = roc_auc_score(all_labels[:, valid_cols], all_preds[:, valid_cols], average='macro')
+        else:
+            auc_score = 0.0
     except Exception:
         auc_score = 0.0
+
 
     return running_loss / len(loader), bal_acc_sum / n_batches, sens_sum / n_batches, spec_sum / n_batches, auc_score, all_labels, all_preds, avg_sens_per_class, avg_spec_per_class
 
@@ -235,7 +241,7 @@ def evaluate_model(model, loader, criterion, device, thresholds=None):
 # ----------------------
 def plot_training_curves(train_losses, train_accs, val_losses, val_accs, out_path):
     try:
-        epochs = np.arange(1, len(train_losses) + 1)
+        epochs = np.arange(0, len(train_losses))
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
         ax1.plot(epochs, train_losses, label="Train Loss", color='blue')
         ax1.plot(epochs, val_losses, label="Val Loss", color='red')
@@ -252,7 +258,7 @@ def plot_training_curves(train_losses, train_accs, val_losses, val_accs, out_pat
 def plot_loss_curves(train_losses, val_losses, out_path):
     """Plot training and validation loss curves"""
     try:
-        epochs = np.arange(1, len(train_losses) + 1)
+        epochs = np.arange(0, len(train_losses))
         plt.figure(figsize=(10, 6))
         plt.plot(epochs, train_losses, label="Training Loss", color='blue', linewidth=2, marker='o', markersize=4)
         plt.plot(epochs, val_losses, label="Validation Loss", color='red', linewidth=2, marker='s', markersize=4)
@@ -271,7 +277,7 @@ def plot_loss_curves(train_losses, val_losses, out_path):
 def plot_sensitivity_specificity_curves(train_sens, train_spec, val_sens, val_spec, out_path):
     """Plot training and validation sensitivity and specificity curves"""
     try:
-        epochs = np.arange(1, len(train_sens) + 1)
+        epochs = np.arange(0, len(train_sens))
         plt.figure(figsize=(10, 6))
         
         # Plot training curves
@@ -356,6 +362,34 @@ def main():
     train_losses, train_accs, val_losses, val_accs = [], [], [], []
     train_sens_list, train_spec_list, val_sens_list, val_spec_list = [], [], [], []
 
+    # ----------------------
+    # Epoch 0: Initial model performance (before training)
+    # ----------------------
+    print("\n📊 Epoch 0: Evaluating initial model performance...")
+    # Only evaluate, don't train for epoch 0
+    train_loss_0, train_bal_acc_0, train_sens_0, train_spec_0, _, _, _, _, _ = evaluate_model(model, train_loader, criterion, device)
+    val_loss_0, val_bal_acc_0, val_sens_0, val_spec_0, val_auc_0, _, _, val_sens_per_class_0, val_spec_per_class_0 = evaluate_model(model, val_loader, criterion, device)
+    
+    # Store initial metrics
+    train_losses.append(train_loss_0); val_losses.append(val_loss_0)
+    train_accs.append(train_bal_acc_0); val_accs.append(val_bal_acc_0)
+    train_sens_list.append(train_sens_0); train_spec_list.append(train_spec_0)
+    val_sens_list.append(val_sens_0); val_spec_list.append(val_spec_0)
+    
+    print(f"Initial Train Balanced Acc: {train_bal_acc_0:.4f} | Sens: {train_sens_0:.4f} | Spec: {train_spec_0:.4f}")
+    print(f"Initial Val Balanced Acc: {val_bal_acc_0:.4f} | Sens: {val_sens_0:.4f} | Spec: {val_spec_0:.4f} | AUC: {val_auc_0:.4f}")
+    
+    # Write initial metrics to CSV
+    csv_line = f"0,{train_loss_0:.6f},{train_bal_acc_0:.6f},{train_sens_0:.6f},{train_spec_0:.6f},"
+    csv_line += f"{val_loss_0:.6f},{val_bal_acc_0:.6f},{val_sens_0:.6f},{val_spec_0:.6f},{val_auc_0:.6f}"
+    
+    # Add per-class validation metrics for epoch 0
+    for i in range(len(class_names)):
+        csv_line += f",{val_sens_per_class_0[i]:.6f},{val_spec_per_class_0[i]:.6f}"
+    
+    with open(METRICS_CSV, "a") as f:
+        f.write(csv_line + "\n")
+
     for epoch in range(1, EPOCHS + 1):
         print(f"\nEpoch {epoch}/{EPOCHS}")
         train_loss, train_bal_acc, train_sens, train_spec = train_one_epoch(model, train_loader, criterion, optimizer, device)
@@ -395,12 +429,21 @@ def main():
     # Threshold calibration
     # ----------------------
     print("\n📊 Calibrating thresholds (target specificity=0.8)...")
-    checkpoint = torch.load(SAVE_PATH, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # ✅ Safety check: ensure the model file exists
+    if os.path.exists(SAVE_PATH):
+        checkpoint = torch.load(SAVE_PATH, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("✅ Loaded best saved model for calibration.")
+    else:
+        print("⚠️ No best model saved yet (AUC=nan or interrupted training). Using last trained model instead.")
+
+    # Proceed with calibration using whichever model is loaded
     _, _, _, _, val_auc, y_true_val, y_pred_val, _, _ = evaluate_model(model, val_loader, criterion, device)
     thresholds = compute_optimal_thresholds(np.array(y_true_val), np.array(y_pred_val), target_spec=0.8)
     np.save(THRESHOLDS_PATH, thresholds)
     print(f"Optimal thresholds saved to: {THRESHOLDS_PATH}")
+
 
     # ----------------------
     # Final test evaluation
