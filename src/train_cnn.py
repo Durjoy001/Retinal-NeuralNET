@@ -147,11 +147,14 @@ def compute_optimal_thresholds(y_true, y_pred, target_spec=0.8):
 # Training Loop
 # ----------------------
 def train_one_epoch(model, loader, criterion, optimizer, device):
+    """Train for one epoch with correct epoch-level sensitivity/specificity."""
     model.train()
-    running_loss, total, bal_acc_sum = 0.0, 0, 0.0
-    sens_sum, spec_sum, n_batches = 0.0, 0.0, 0
-    pbar = tqdm(loader, desc="Training", leave=False)
+    running_loss = 0.0
 
+    # Initialize total counters
+    TP = TN = FP = FN = None
+
+    pbar = tqdm(loader, desc="Training", leave=False)
     for images, labels in pbar:
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
@@ -159,32 +162,44 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-
         running_loss += loss.item()
+
+        # Convert outputs to binary predictions
         preds = (torch.sigmoid(outputs) > 0.5).float()
 
-        sens, spec = compute_sens_spec(preds, labels, average="micro")
-        bal_acc = 0.5 * (sens + spec)
-        bal_acc_sum += bal_acc
-        sens_sum += sens
-        spec_sum += spec
-        n_batches += 1
+        # Compute counts per class
+        tp = (preds * labels).sum(dim=0)
+        tn = ((1 - preds) * (1 - labels)).sum(dim=0)
+        fp = (preds * (1 - labels)).sum(dim=0)
+        fn = ((1 - preds) * labels).sum(dim=0)
 
-        pbar.set_postfix({"loss": f"{loss.item():.4f}", "bal_acc": f"{bal_acc:.4f}", "sens": f"{sens:.4f}", "spec": f"{spec:.4f}"})
+        # Accumulate totals
+        if TP is None:
+            TP, TN, FP, FN = tp, tn, fp, fn
+        else:
+            TP += tp; TN += tn; FP += fp; FN += fn
 
-    return running_loss / len(loader), bal_acc_sum / n_batches, sens_sum / n_batches, spec_sum / n_batches
+    # Compute epoch-level metrics
+    sens = (TP.sum() / (TP.sum() + FN.sum() + 1e-6)).item()
+    spec = (TN.sum() / (TN.sum() + FP.sum() + 1e-6)).item()
+    bal_acc = 0.5 * (sens + spec)
+
+    avg_loss = running_loss / len(loader)
+    return avg_loss, bal_acc, sens, spec
 
 # ----------------------
 # Evaluation Loop
 # ----------------------
 @torch.no_grad()
 def evaluate_model(model, loader, criterion, device, thresholds=None):
+    """Evaluate with global epoch-level sensitivity/specificity and per-class metrics."""
     model.eval()
-    running_loss, bal_acc_sum, sens_sum, spec_sum, n_batches = 0.0, 0.0, 0.0, 0.0, 0
+    running_loss = 0.0
+    TP = TN = FP = FN = None
     all_preds, all_labels = [], []
-    all_sens_per_class, all_spec_per_class = [], []
 
-    for images, labels in tqdm(loader, desc="Evaluating", leave=False):
+    pbar = tqdm(loader, desc="Evaluating", leave=False)
+    for images, labels in pbar:
         images, labels = images.to(device), labels.to(device)
         outputs = model(images)
         loss = criterion(outputs, labels)
@@ -192,39 +207,44 @@ def evaluate_model(model, loader, criterion, device, thresholds=None):
 
         probs = torch.sigmoid(outputs).cpu().numpy()
         labels_np = labels.cpu().numpy()
+
         if thresholds is None:
             preds = (probs > 0.5).astype(float)
         else:
             preds = (probs > thresholds).astype(float)
 
-        preds_torch = torch.tensor(preds)
-        labels_torch = torch.tensor(labels_np)
+        preds_t = torch.tensor(preds)
+        labels_t = torch.tensor(labels_np)
 
-        sens, spec = compute_sens_spec(preds_torch, labels_torch, average="macro")
-        bal_acc = 0.5 * (sens + spec)
-        bal_acc_sum += bal_acc
-        sens_sum += sens
-        spec_sum += spec
-        n_batches += 1
+        # Compute counts and accumulate
+        tp = (preds_t * labels_t).sum(dim=0)
+        tn = ((1 - preds_t) * (1 - labels_t)).sum(dim=0)
+        fp = (preds_t * (1 - labels_t)).sum(dim=0)
+        fn = ((1 - preds_t) * labels_t).sum(dim=0)
 
-        # Compute per-class metrics
-        sens_per_class, spec_per_class = compute_per_class_sens_spec(preds_torch, labels_torch)
-        all_sens_per_class.append(sens_per_class)
-        all_spec_per_class.append(spec_per_class)
+        if TP is None:
+            TP, TN, FP, FN = tp, tn, fp, fn
+        else:
+            TP += tp; TN += tn; FP += fp; FN += fn
 
-        all_preds.extend(probs)
-        all_labels.extend(labels_np)
+        all_preds.append(probs)
+        all_labels.append(labels_np)
 
-    all_preds, all_labels = np.array(all_preds), np.array(all_labels)
-    all_sens_per_class = np.array(all_sens_per_class)
-    all_spec_per_class = np.array(all_spec_per_class)
-    
-    # Average per-class metrics across batches
-    avg_sens_per_class = np.mean(all_sens_per_class, axis=0)
-    avg_spec_per_class = np.mean(all_spec_per_class, axis=0)
-    
+    # Convert accumulated data
+    all_preds = np.vstack(all_preds)
+    all_labels = np.vstack(all_labels)
+
+    # Compute global metrics
+    sens = (TP.sum() / (TP.sum() + FN.sum() + 1e-6)).item()
+    spec = (TN.sum() / (TN.sum() + FP.sum() + 1e-6)).item()
+    bal_acc = 0.5 * (sens + spec)
+
+    # Per-class sensitivity/specificity
+    sens_per_class = (TP / (TP + FN + 1e-6)).cpu().numpy()
+    spec_per_class = (TN / (TN + FP + 1e-6)).cpu().numpy()
+
+    # AUC (masked to valid classes)
     try:
-        # Compute AUC only for valid classes
         valid_cols = (np.sum(all_labels, axis=0) > 0) & (np.sum(all_labels == 0, axis=0) > 0)
         if np.any(valid_cols):
             auc_score = roc_auc_score(all_labels[:, valid_cols], all_preds[:, valid_cols], average='macro')
@@ -233,8 +253,9 @@ def evaluate_model(model, loader, criterion, device, thresholds=None):
     except Exception:
         auc_score = 0.0
 
+    avg_loss = running_loss / len(loader)
+    return avg_loss, bal_acc, sens, spec, auc_score, all_labels, all_preds, sens_per_class, spec_per_class
 
-    return running_loss / len(loader), bal_acc_sum / n_batches, sens_sum / n_batches, spec_sum / n_batches, auc_score, all_labels, all_preds, avg_sens_per_class, avg_spec_per_class
 
 # ----------------------
 # Plotting
@@ -459,6 +480,17 @@ def main():
         for i, class_name in enumerate(class_names):
             f.write(f"{class_name},{test_sens_per_class[i]:.6f},{test_spec_per_class[i]:.6f}\n")
     
+    # Save overall final test results
+    overall_results_csv = RESULTS_DIR / "overall_test_results.csv"
+    with open(overall_results_csv, "w") as f:
+        f.write("metric,value\n")
+        f.write(f"test_loss,{test_loss:.6f}\n")
+        f.write(f"test_balanced_accuracy,{test_bal_acc:.6f}\n")
+        f.write(f"test_sensitivity,{test_sens:.6f}\n")
+        f.write(f"test_specificity,{test_spec:.6f}\n")
+        f.write(f"test_auc,{test_auc:.6f}\n")
+        f.write(f"best_validation_auc,{best_val_auc:.6f}\n")
+    
     print(f"\n🎉 Training completed!")
     print(f"Best validation AUC: {best_val_auc:.4f}")
     print(f"Final test results:")
@@ -470,6 +502,7 @@ def main():
     print(f"Thresholds saved to: {THRESHOLDS_PATH}")
     print(f"Training metrics saved to: {METRICS_CSV}")
     print(f"Final test per-class results saved to: {test_results_csv}")
+    print(f"Overall test results saved to: {overall_results_csv}")
 
 if __name__ == "__main__":
     main()
