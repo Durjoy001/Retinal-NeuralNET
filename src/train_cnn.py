@@ -1,6 +1,6 @@
 # src/train_cnn.py
 # DenseNet121 training script for RFMiD retinal fundus multi-disease classification
-# Multi-label classification with 45 disease classes using ImageNet-pretrained DenseNet121
+# Multi-label classification with 28 disease classes using ImageNet-pretrained DenseNet121
 # ✅ Includes Sensitivity/Specificity masking, per-class threshold calibration, balanced accuracy, and AUC-based model saving
 
 import os
@@ -31,12 +31,17 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 # Paths
 # ----------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT_DIR / "data" / "RFMiD_All_Classes_Dataset"
+DATA_DIR = ROOT_DIR / "data" / "RFMiD_Challenge_Dataset"  # FIXED: RFMiD spelling
 RESULTS_DIR = ROOT_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 SAVE_PATH = RESULTS_DIR / "densenet121_rfmid_best.pth"
 METRICS_CSV = RESULTS_DIR / "densenet121_metrics.csv"
 THRESHOLDS_PATH = RESULTS_DIR / "optimal_thresholds.npy"
+SAVE_PATH_ANY = RESULTS_DIR / "densenet121_rfmid_best_any_abnormal.pth"  # NEW
+
+PATIENCE = 5        # stop if val loss doesn't improve for 5 epochs
+MIN_DELTA = 1e-4    # minimum improvement to be considered "better"
+
 
 # ----------------------
 # Reproducibility
@@ -53,9 +58,9 @@ torch.backends.cudnn.benchmark = False
 # Dataset
 # ----------------------
 class RFMiDDataset(Dataset):
-    def __init__(self, img_dir, labels_df, transform=None):
+    def __init__(self, img_dir, labels_df, label_columns, transform=None):
         self.img_dir, self.labels_df, self.transform = img_dir, labels_df, transform
-        self.label_columns = [c for c in labels_df.columns if c != 'ID']
+        self.label_columns = label_columns
         self.num_classes = len(self.label_columns)
 
     def __len__(self): return len(self.labels_df)
@@ -77,7 +82,7 @@ class RFMiDDataset(Dataset):
 # DenseNet Model
 # ----------------------
 class RFMiDDenseNet121(nn.Module):
-    def __init__(self, num_classes=45):
+    def __init__(self, num_classes=28):
         super().__init__()
         self.backbone = models.densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
         num_features = self.backbone.classifier.in_features
@@ -142,6 +147,27 @@ def compute_optimal_thresholds(y_true, y_pred, target_spec=0.8):
         except Exception:
             thresholds.append(0.5)
     return np.array(thresholds)
+
+# =============== NEW: helpers for "Any Abnormal vs Normal" overall metrics ===============
+from sklearn.metrics import precision_recall_curve, confusion_matrix
+
+def _pick_threshold_for_specificity(y_true_binary, y_score, target_spec=0.8):
+    """Return threshold that achieves target specificity (closest), along with achieved spec/sens."""
+    fpr, tpr, thr = roc_curve(y_true_binary, y_score)
+    spec = 1 - fpr
+    idx = np.argmin(np.abs(spec - target_spec))
+    return float(thr[idx]), float(spec[idx]), float(tpr[idx])
+
+def _compute_f1max(y_true_binary, y_score):
+    """Compute F1max and its threshold using the PR curve."""
+    precision, recall, thr = precision_recall_curve(y_true_binary, y_score)
+    # precision_recall_curve returns len(thr) = len(precision) - 1
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    f1_use = f1[:-1]
+    best_idx = int(np.nanargmax(f1_use))
+    return float(f1_use[best_idx]), float(thr[best_idx]), float(precision[best_idx]), float(recall[best_idx])
+# ========================================================================================
+
 
 # ----------------------
 # Training Loop
@@ -333,6 +359,20 @@ def main():
     val_labels = pd.read_csv(DATA_DIR / "2. Groundtruths" / "b. RFMiD_Validation_Labels.csv")
     test_labels = pd.read_csv(DATA_DIR / "2. Groundtruths" / "c. RFMiD_Testing_Labels.csv")
 
+    # --- Freeze label schema from TRAIN and reindex VAL/TEST to match ---
+    label_columns = [c for c in train_labels.columns if c != "ID"]
+    val_labels  = val_labels.reindex(columns=["ID"] + label_columns, fill_value=0)
+    test_labels = test_labels.reindex(columns=["ID"] + label_columns, fill_value=0)
+    # -------------------------------------------------------------------
+
+    # --- Compute per-class pos_weight from TRAIN ONLY (for BCEWithLogitsLoss) ---
+    y = train_labels[label_columns].values
+    pos = y.sum(axis=0)
+    neg = y.shape[0] - pos
+    pos_weight = torch.tensor((neg / (pos + 1e-6)).astype(np.float32)).to(device)
+    # ---------------------------------------------------------------------------
+
+
     print(f"Training samples: {len(train_labels)}, Validation: {len(val_labels)}, Test: {len(test_labels)}")
 
     train_transform = transforms.Compose([
@@ -349,16 +389,17 @@ def main():
         transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
     ])
 
-    train_dataset = RFMiDDataset(DATA_DIR / "1. Original Images" / "a. Training Set", train_labels, train_transform)
-    val_dataset = RFMiDDataset(DATA_DIR / "1. Original Images" / "b. Validation Set", val_labels, val_test_transform)
-    test_dataset = RFMiDDataset(DATA_DIR / "1. Original Images" / "c. Testing Set", test_labels, val_test_transform)
+    train_dataset = RFMiDDataset(DATA_DIR / "1. Original Images" / "a. Training Set", train_labels, label_columns, train_transform)
+    val_dataset = RFMiDDataset(DATA_DIR / "1. Original Images" / "b. Validation Set", val_labels, label_columns, val_test_transform)
+    test_dataset = RFMiDDataset(DATA_DIR / "1. Original Images" / "c. Testing Set", test_labels, label_columns, val_test_transform)
 
     train_loader = DataLoader(train_dataset, BATCH_SIZE, True, num_workers=NUM_WORKERS)
     val_loader = DataLoader(val_dataset, BATCH_SIZE, False, num_workers=NUM_WORKERS)
     test_loader = DataLoader(test_dataset, BATCH_SIZE, False, num_workers=NUM_WORKERS)
 
     model = RFMiDDenseNet121(num_classes=train_dataset.num_classes).to(device)
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
 
     backbone_params = list(model.backbone.features.parameters())
     classifier_params = list(model.backbone.classifier.parameters())
@@ -379,7 +420,8 @@ def main():
     with open(METRICS_CSV, "w") as f:
         f.write(header + "\n")
 
-    best_val_auc = 0.0
+    best_val_auc = 0.0          # per-class macro AUC (already used)
+    best_any_auc = 0.0          # NEW: any-abnormal validation AUC
     train_losses, train_accs, val_losses, val_accs = [], [], [], []
     train_sens_list, train_spec_list, val_sens_list, val_spec_list = [], [], [], []
 
@@ -411,10 +453,17 @@ def main():
     with open(METRICS_CSV, "a") as f:
         f.write(csv_line + "\n")
 
+    # --- Early stopping state (on validation loss) ---
+    best_val_loss_for_es = float('inf')
+    epochs_no_improve = 0
+    # -------------------------------------------------
+
+
     for epoch in range(1, EPOCHS + 1):
         print(f"\nEpoch {epoch}/{EPOCHS}")
         train_loss, train_bal_acc, train_sens, train_spec = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_bal_acc, val_sens, val_spec, val_auc, _, _, val_sens_per_class, val_spec_per_class = evaluate_model(model, val_loader, criterion, device)
+        # REPLACED: capture y_true/y_pred for any-abnormal AUC
+        val_loss, val_bal_acc, val_sens, val_spec, val_auc, y_true_val_all, y_pred_val_all, val_sens_per_class, val_spec_per_class = evaluate_model(model, val_loader, criterion, device)
 
         scheduler.step(val_loss)
         train_losses.append(train_loss); val_losses.append(val_loss)
@@ -425,16 +474,41 @@ def main():
         print(f"Train Balanced Acc: {train_bal_acc:.4f} | Sens: {train_sens:.4f} | Spec: {train_spec:.4f}")
         print(f"Val Balanced Acc: {val_bal_acc:.4f} | Sens: {val_sens:.4f} | Spec: {val_spec:.4f} | AUC: {val_auc:.4f}")
 
-        # Write comprehensive metrics to CSV
+        # --- NEW: compute any-abnormal validation AUC and checkpoint ---
+        y_true_any_val = (np.sum(y_true_val_all, axis=1) > 0).astype(np.int32)
+        y_score_any_val = np.max(y_pred_val_all, axis=1)  # aggregator for "any abnormal"
+        val_auc_any = roc_auc_score(y_true_any_val, y_score_any_val)
+        if val_auc_any > best_any_auc:
+            best_any_auc = val_auc_any
+            torch.save({'model_state_dict': model.state_dict()}, SAVE_PATH_ANY)
+            print(f"💾 Best ANY-ABNORMAL model saved! (val AUC_any={val_auc_any:.4f})")
+
+        # ---- Write comprehensive metrics to CSV BEFORE early-stopping check ----
         csv_line = f"{epoch},{train_loss:.6f},{train_bal_acc:.6f},{train_sens:.6f},{train_spec:.6f},"
         csv_line += f"{val_loss:.6f},{val_bal_acc:.6f},{val_sens:.6f},{val_spec:.6f},{val_auc:.6f}"
-        
-        # Add per-class validation metrics
         for i in range(len(class_names)):
             csv_line += f",{val_sens_per_class[i]:.6f},{val_spec_per_class[i]:.6f}"
-        
         with open(METRICS_CSV, "a") as f:
             f.write(csv_line + "\n")
+        # -----------------------------------------------------------------------
+
+        # --- Early stopping check (val loss) ---
+        if val_loss < (best_val_loss_for_es - MIN_DELTA):
+            best_val_loss_for_es = val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            print(f"[ES] No val-loss improvement for {epochs_no_improve}/{PATIENCE} epoch(s).")
+
+        # If patience exhausted, stop training loop (we still keep best-AUC checkpoint)
+        if epochs_no_improve >= PATIENCE:
+            print(f"[ES] Early stopping triggered (patience={PATIENCE}).")
+            # still make the latest plots before breaking
+            plot_training_curves(train_losses, train_accs, val_losses, val_accs, RESULTS_DIR / "training_curves.png")
+            plot_loss_curves(train_losses, val_losses, RESULTS_DIR / "loss_curves.png")
+            plot_sensitivity_specificity_curves(train_sens_list, train_spec_list, val_sens_list, val_spec_list, RESULTS_DIR / "sensitivity_specificity_curves.png")
+            break
+        # -------------------------------------------------
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
@@ -464,6 +538,100 @@ def main():
     thresholds = compute_optimal_thresholds(np.array(y_true_val), np.array(y_pred_val), target_spec=0.8)
     np.save(THRESHOLDS_PATH, thresholds)
     print(f"Optimal thresholds saved to: {THRESHOLDS_PATH}")
+
+    # =============== NEW: Overall "Any Abnormal vs Normal" metrics (single-row) ===============
+    # Build validation binary labels/scores to choose threshold at ~0.80 specificity
+    y_true_any_val = (np.sum(y_true_val, axis=1) > 0).astype(np.int32)
+    # Use the max disease probability as a score for "any abnormal"
+    y_score_any_val = np.max(y_pred_val, axis=1)
+    thr_any, spec_any_val, sens_any_val = _pick_threshold_for_specificity(y_true_any_val, y_score_any_val, target_spec=0.8)
+    print(f"🔧 Any-abnormal validation operating point @~0.80 specificity: thr={thr_any:.4f}, spec={spec_any_val:.4f}, sens={sens_any_val:.4f}")
+
+    # ✅ Load the best ANY-ABNORMAL checkpoint for overall metrics
+    if os.path.exists(SAVE_PATH_ANY):
+        checkpoint_any = torch.load(SAVE_PATH_ANY, map_location=device)
+        model.load_state_dict(checkpoint_any['model_state_dict'])
+        print("✅ Loaded best any-abnormal model for overall metrics.")
+
+        # 🔁 Recompute the validation-based any-abnormal threshold for THIS checkpoint
+        _, _, _, _, _, y_true_val_anyCkpt, y_pred_val_anyCkpt, _, _ = evaluate_model(
+            model, val_loader, criterion, device
+        )
+        y_true_any_val_ckpt  = (np.sum(y_true_val_anyCkpt, axis=1) > 0).astype(np.int32)
+        y_score_any_val_ckpt = np.max(y_pred_val_anyCkpt, axis=1)
+        thr_any, spec_any_val, sens_any_val = _pick_threshold_for_specificity(
+            y_true_any_val_ckpt, y_score_any_val_ckpt, target_spec=0.8
+        )
+        print(f"🔧 Recomputed any-abnormal val operating point for any-ckpt: "
+            f"thr={thr_any:.4f}, spec={spec_any_val:.4f}, sens={sens_any_val:.4f}")
+    else:
+        print("⚠️ No any-abnormal checkpoint found; using current model for overall metrics.")
+
+    # Get test labels/scores (raw probs; no thresholds)
+    _, _, _, _, _, y_true_test_all, y_pred_test_all, _, _ = evaluate_model(model, test_loader, criterion, device)
+
+    y_true_any_test = (np.sum(y_true_test_all, axis=1) > 0).astype(np.int32)
+    y_score_any_test = np.max(y_pred_test_all, axis=1)
+
+    # AUC on test
+    auc_any = roc_auc_score(y_true_any_test, y_score_any_test)
+
+    # Apply validation-derived threshold to test
+    y_pred_any_test = (y_score_any_test >= thr_any).astype(np.int32)
+    tn, fp, fn, tp = confusion_matrix(y_true_any_test, y_pred_any_test, labels=[0,1]).ravel()
+    precision_at_thr = tp / (tp + fp + 1e-8)
+    recall_at_thr = tp / (tp + fn + 1e-8)
+
+    # F1max (and its threshold) on test
+    f1max, thr_f1, prec_f1, rec_f1 = _compute_f1max(y_true_any_test, y_score_any_test)
+
+    # Save single-row CSV for overall comparison
+    overall_csv = RESULTS_DIR / "overall_any_abnormal_metrics.csv"
+    with open(overall_csv, "w") as f:
+        f.write("Metric,Value\n")
+        f.write(f"AUC (%),{auc_any*100:.4f}\n")
+        f.write(f"Threshold@0.80spec,{thr_any:.6f}\n")
+        f.write(f"Precision@Thr,{precision_at_thr*100:.4f}\n")
+        f.write(f"Recall@Thr (%),{recall_at_thr*100:.4f}\n")
+        f.write(f"TP,{int(tp)}\n")
+        f.write(f"TN,{int(tn)}\n")
+        f.write(f"FP,{int(fp)}\n")
+        f.write(f"FN,{int(fn)}\n")
+        f.write(f"F1max,{f1max:.6f}\n")
+        f.write(f"F1max_Threshold,{thr_f1:.6f}\n")
+        f.write(f"F1max_Precision,{prec_f1*100:.4f}\n")
+        f.write(f"F1max_Recall (%),{rec_f1*100:.4f}\n")
+    print(f"🧾 Wrote overall any-abnormal metrics to: {overall_csv}")
+    # ==========================================================================================
+
+    # ================== SAVE PER-IMAGE OUTPUTS FOR LATER STATS (DeLong & McNemar) ==================
+    # Save validation per-image arrays (for transparency / re-deriving operating points if needed)
+    val_stats_npz = RESULTS_DIR / "cnn_anyabnormal_val_outputs.npz"
+    np.savez(val_stats_npz,
+             ids=val_labels["ID"].values,                  # order matches val_loader (no shuffle)
+             y_true=(np.sum(y_true_val, axis=1) > 0).astype(np.int8),
+             y_score=np.max(y_pred_val, axis=1).astype(np.float32))
+    print(f"💾 Saved validation per-image any-abnormal outputs to: {val_stats_npz}")
+
+    # Save test per-image arrays needed for DeLong and McNemar
+    test_stats_npz = RESULTS_DIR / "cnn_anyabnormal_test_outputs.npz"
+    np.savez(test_stats_npz,
+             ids=test_labels["ID"].values,                 # order matches test_loader (no shuffle)
+             y_true=y_true_any_test.astype(np.int8),
+             y_score=y_score_any_test.astype(np.float32),  # continuous scores for DeLong
+             y_pred_at_spec80=(y_score_any_test >= thr_any).astype(np.int8),  # for McNemar
+             thr_spec80=float(thr_any))
+    print(f"💾 Saved test per-image any-abnormal outputs to: {test_stats_npz}")
+    # ================================================================================================
+ 
+
+    # 🔁 Switch back to the best-AUC checkpoint so thresholds and weights match
+    if os.path.exists(SAVE_PATH):
+        checkpoint = torch.load(SAVE_PATH, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("✅ Restored best-AUC checkpoint for per-class thresholded evaluation.")
+    else:
+        print("⚠️ Expected best-AUC checkpoint not found; proceeding with current weights.")
 
 
     # ----------------------
