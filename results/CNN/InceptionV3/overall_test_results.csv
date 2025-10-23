@@ -1,0 +1,7 @@
+metric,value
+test_loss,1.081942
+test_balanced_accuracy,0.794313
+test_sensitivity,0.744681
+test_specificity,0.843946
+test_auc,0.809502
+best_validation_auc,0.829029
