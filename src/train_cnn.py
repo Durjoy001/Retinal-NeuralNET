@@ -104,7 +104,7 @@ def get_transforms(model_name: str, train: bool):
 # Original DenseNet Model (kept for completeness)
 # ----------------------
 class RFMiDDenseNet121(nn.Module):
-    def __init__(self, num_classes=28):
+    def __init__(self, num_classes=29):
         super().__init__()
         self.backbone = models.densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
         num_features = self.backbone.classifier.in_features
@@ -333,6 +333,16 @@ def evaluate_model(model, loader, criterion, device, thresholds=None):
 
     avg_loss = running_loss / len(loader)
     return avg_loss, bal_acc, sens, spec, auc_score, all_labels, all_preds, sens_per_class, spec_per_class
+
+def overall_confusion_from_batches(all_labels, all_preds, thresholds=None):
+    """Calculate overall TP, TN, FP, FN from batched predictions and labels"""
+    thr = 0.5 if thresholds is None else thresholds
+    preds = (all_preds > thr).astype(float)
+    TP = (preds * all_labels).sum()
+    TN = ((1 - preds) * (1 - all_labels)).sum()
+    FP = (preds * (1 - all_labels)).sum()
+    FN = ((1 - preds) * all_labels).sum()
+    return int(TP), int(TN), int(FP), int(FN)
 
 # ----------------------
 # Plotting
@@ -650,7 +660,7 @@ def run_for_model(model_name: str):
         print("⚠️ Expected best-AUC checkpoint not found; proceeding with current weights.")
 
     print("\n🧪 Final evaluation on test set (using calibrated thresholds)...")
-    test_loss, test_bal_acc, test_sens, test_spec, test_auc, _, _, test_sens_per_class, test_spec_per_class = evaluate_model(model, test_loader, criterion, device, thresholds)
+    test_loss, test_bal_acc, test_sens, test_spec, test_auc, test_all_labels, test_all_preds, test_sens_per_class, test_spec_per_class = evaluate_model(model, test_loader, criterion, device, thresholds)
     print(f"Test Balanced Acc: {test_bal_acc:.4f} | Sens: {test_sens:.4f} | Spec: {test_spec:.4f} | AUC: {test_auc:.4f}")
 
     test_results_csv = RESULTS_DIR / "final_test_results.csv"
@@ -659,6 +669,14 @@ def run_for_model(model_name: str):
         for i, class_name in enumerate(class_names):
             f.write(f"{class_name},{test_sens_per_class[i]:.6f},{test_spec_per_class[i]:.6f}\n")
 
+    # Calculate additional metrics for overall test results
+    test_tp, test_tn, test_fp, test_fn = overall_confusion_from_batches(test_all_labels, test_all_preds, thresholds)
+    precision_overall = test_tp / (test_tp + test_fp + 1e-8)
+    recall_overall = test_tp / (test_tp + test_fn + 1e-8)
+    
+    # Calculate F1max for overall results
+    f1max_overall, thr_f1_overall, prec_f1_overall, rec_f1_overall = _compute_overall_f1max(test_all_labels, test_all_preds)
+    
     overall_results_csv = RESULTS_DIR / "overall_test_results.csv"
     with open(overall_results_csv, "w") as f:
         f.write("metric,value\n")
@@ -668,6 +686,16 @@ def run_for_model(model_name: str):
         f.write(f"test_specificity,{test_spec:.6f}\n")
         f.write(f"test_auc,{test_auc:.6f}\n")
         f.write(f"best_validation_auc,{best_val_auc:.6f}\n")
+        f.write(f"test_precision,{precision_overall:.6f}\n")
+        f.write(f"test_recall,{recall_overall:.6f}\n")
+        f.write(f"test_tp,{int(test_tp)}\n")
+        f.write(f"test_tn,{int(test_tn)}\n")
+        f.write(f"test_fp,{int(test_fp)}\n")
+        f.write(f"test_fn,{int(test_fn)}\n")
+        f.write(f"test_f1max,{f1max_overall:.6f}\n")
+        f.write(f"test_f1max_threshold,{thr_f1_overall:.6f}\n")
+        f.write(f"test_f1max_precision,{prec_f1_overall:.6f}\n")
+        f.write(f"test_f1max_recall,{rec_f1_overall:.6f}\n")
 
     print(f"\n🎉 Training completed for {pretty}!")
     print(f"Best validation AUC: {best_val_auc:.4f}")
@@ -690,6 +718,30 @@ def _compute_f1max(y_true_binary, y_score):
     precision, recall, thr = precision_recall_curve(y_true_binary, y_score)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
     f1_use = f1[:-1]
+    best_idx = int(np.nanargmax(f1_use))
+    return float(f1_use[best_idx]), float(thr[best_idx]), float(precision[best_idx]), float(recall[best_idx])
+
+def _compute_overall_f1max(all_labels, all_preds):
+    """Compute F1max for overall multi-class classification using micro-averaging"""
+    # For multi-class, we need to compute F1max using micro-averaging
+    # This means treating all classes as one big binary classification problem
+    
+    # Flatten all predictions and labels for micro-averaging
+    y_true_flat = all_labels.flatten()
+    y_score_flat = all_preds.flatten()
+    
+    # Only consider valid predictions (where there are both positive and negative samples)
+    valid_mask = np.isfinite(y_score_flat)
+    y_true_valid = y_true_flat[valid_mask]
+    y_score_valid = y_score_flat[valid_mask]
+    
+    if len(y_true_valid) == 0 or len(np.unique(y_true_valid)) < 2:
+        return 0.0, 0.5, 0.0, 0.0
+    
+    # Use precision_recall_curve for micro-averaged F1max
+    precision, recall, thr = precision_recall_curve(y_true_valid, y_score_valid)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    f1_use = f1[:-1]  # Remove last element as it's always 1.0
     best_idx = int(np.nanargmax(f1_use))
     return float(f1_use[best_idx]), float(thr[best_idx]), float(precision[best_idx]), float(recall[best_idx])
 
