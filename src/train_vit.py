@@ -47,7 +47,7 @@ METRICS_CSV = None
 THRESHOLDS_PATH = None
 SAVE_PATH_ANY = None
 
-PATIENCE = 5        # stop if val loss doesn't improve for 5 epochs
+PATIENCE = 10        # stop if val loss doesn't improve for 10 epochs (was 5)
 MIN_DELTA = 1e-4    # minimum improvement to be considered "better"
 
 # ----------------------
@@ -130,22 +130,22 @@ def build_model(model_name, num_classes):
 
     if model_name == "swin_tiny":
         # Swin-Tiny: swin_tiny_patch4_window7_224 (~28M params)
-        model = timm.create_model('swin_tiny_patch4_window7_224', pretrained=True, num_classes=0)
+        model = timm.create_model('swin_tiny_patch4_window7_224', pretrained=True, num_classes=0, drop_path_rate=0.2)
         in_f = model.num_features  # Get feature dimension
         
     elif model_name == "vit_small":
         # ViT-Small/16: vit_small_patch16_224 (~22M params)
-        model = timm.create_model('vit_small_patch16_224', pretrained=True, num_classes=0)
+        model = timm.create_model('vit_small_patch16_224', pretrained=True, num_classes=0, drop_path_rate=0.2)
         in_f = model.num_features
         
     elif model_name == "deit_small":
         # DeiT-Small/16: deit_small_patch16_224 (~22M params)
-        model = timm.create_model('deit_small_patch16_224', pretrained=True, num_classes=0)
+        model = timm.create_model('deit_small_patch16_224', pretrained=True, num_classes=0, drop_path_rate=0.2)
         in_f = model.num_features
         
     elif model_name == "crossvit_small":
         # CrossViT-Small: crossvit_15_240 (~27M params)
-        model = timm.create_model('crossvit_15_240', pretrained=True, num_classes=0)
+        model = timm.create_model('crossvit_15_240', pretrained=True, num_classes=0, drop_path_rate=0.2)
         in_f = model.num_features
         
     else:
@@ -172,6 +172,55 @@ def build_model(model_name, num_classes):
             return self.classifier(features)
     
     return ViTWrapper(model, classifier)
+
+# ---------- Temperature scaling ----------
+class _TempScaler(nn.Module):
+    def __init__(self, init_T=1.0):
+        super().__init__()
+        self.logT = nn.Parameter(torch.tensor(math.log(init_T), dtype=torch.float32))
+
+    def forward(self, logits):
+        T = torch.exp(self.logT)
+        return logits / T
+
+def _gather_val_logits_labels(model, loader, device):
+    model.eval()
+    all_logits, all_labels = [], []
+    with torch.inference_mode():
+        for x, y in loader:
+            x = x.to(device)
+            logits = model(x)
+            all_logits.append(logits.cpu())
+            all_labels.append(y)
+    return torch.cat(all_logits, 0), torch.cat(all_labels, 0)
+
+def fit_temperature(model, val_loader, device):
+    logits, labels = _gather_val_logits_labels(model, val_loader, device)
+    scaler = _TempScaler(init_T=1.0).to(device)
+    optimizer = torch.optim.LBFGS(scaler.parameters(), lr=0.1, max_iter=50, line_search_fn="strong_wolfe")
+    criterion = nn.BCEWithLogitsLoss(reduction="mean")
+
+    logits, labels = logits.to(device), labels.to(device)
+
+    def closure():
+        optimizer.zero_grad()
+        scaled = scaler(logits)
+        loss = criterion(scaled, labels)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    with torch.no_grad():
+        T = torch.exp(scaler.logT).item()
+    return T
+
+class _WithTemp(nn.Module):
+    def __init__(self, base, T):
+        super().__init__()
+        self.base = base
+        self.T = float(T)
+    def forward(self, x):
+        return self.base(x) / self.T
 
 # ----------------------
 # Metric Helpers
@@ -256,7 +305,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler):
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
             outputs = model(images)
             if isinstance(outputs, tuple):  # Inception train mode: (main, aux)
                 main_out, aux_out = outputs
@@ -267,6 +316,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler):
                 logits_for_metrics = outputs
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
         running_loss += loss.item()
@@ -488,8 +539,8 @@ def run_for_model(model_name: str):
     classifier_params = list(model.classifier.parameters())
 
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': 5e-4 * 0.5, 'weight_decay': 0.05},
-        {'params': classifier_params, 'lr': 5e-4, 'weight_decay': 0.05},
+        {'params': backbone_params,   'lr': 5e-5, 'weight_decay': 0.05},  # Gentle LR for backbone
+        {'params': classifier_params, 'lr': 5e-4, 'weight_decay': 0.00},  # Zero WD on head
     ])
     scheduler = cosine_with_warmup(optimizer, warmup_epochs=5, total_epochs=EPOCHS)
 
@@ -531,7 +582,7 @@ def run_for_model(model_name: str):
     epochs_no_improve = 0
     
     # Mixed precision scaler
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
 
     for epoch in range(1, EPOCHS + 1):
         print(f"\nEpoch {epoch}/{EPOCHS}")
