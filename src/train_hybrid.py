@@ -99,24 +99,27 @@ def cosine_with_warmup(optimizer, warmup_epochs=5, total_epochs=20):
 # ----------------------
 # Per-model pretrained transforms using timm configs
 # ----------------------
+# Cache for resolved data configs to avoid repeated model instantiation
+_VIT_CFG_CACHE = {}
+
 def vit_transforms(model_name: str, train: bool):
     """Get transforms for hybrid models using timm's pretrained configurations"""
     model_name = model_name.lower()
     
     # Map model names to timm model identifiers
     model_map = {
-        "coatnet0": "coatnet_0",
-        "cmt_tiny": "cmt_tiny",
+        "coatnet0": "coatnet_0_rw_224.sw_in1k",
+        "maxvit_tiny": "maxvit_tiny_rw_256",
     }
     
     if model_name not in model_map:
         raise ValueError(f"Unknown hybrid model name: {model_name}")
     
-    # Create model to get its data config
-    m = timm.create_model(model_map[model_name], pretrained=True, num_classes=1)
-    cfg = resolve_data_config({}, model=m)
-    
-    # Create transforms using timm's factory
+    # Resolve and cache data config once per model_name
+    if model_name not in _VIT_CFG_CACHE:
+        m = timm.create_model(model_map[model_name], pretrained=True, num_classes=1)
+        _VIT_CFG_CACHE[model_name] = resolve_data_config({}, model=m)
+    cfg = _VIT_CFG_CACHE[model_name]
     return create_transform(**cfg, is_training=train)
 
 # ----------------------
@@ -128,12 +131,12 @@ def build_model(model_name, num_classes):
 
     if model_name == "coatnet0":
         # CoAtNet-0: hybrid CNN/ViT architecture
-        backbone = timm.create_model('coatnet_0', pretrained=True, num_classes=0, drop_path_rate=0.2)
+        backbone = timm.create_model('coatnet_0_rw_224.sw_in1k', pretrained=True, num_classes=0, drop_path_rate=0.2)
         in_f = backbone.num_features
         
-    elif model_name == "cmt_tiny":
-        # CMT Tiny: hybrid CNN-Transformer architecture
-        backbone = timm.create_model('cmt_tiny', pretrained=True, num_classes=0, drop_path_rate=0.2)
+    elif model_name == "maxvit_tiny":
+        # MaxViT-Tiny (256): hybrid attention architecture
+        backbone = timm.create_model('maxvit_tiny_rw_256', pretrained=True, num_classes=0, drop_path_rate=0.2)
         in_f = backbone.num_features
         
     else:
@@ -466,7 +469,7 @@ def run_for_model(model_name: str):
 
     pretty = {
         "coatnet0": "CoAtNet0",
-        "cmt_tiny": "CMTTiny",
+        "maxvit_tiny": "MaxViTTiny",
     }[model_name.lower()]
 
     RESULTS_DIR = ROOT_DIR / "results" / "Hybrid" / pretty
@@ -477,7 +480,12 @@ def run_for_model(model_name: str):
     SAVE_PATH_ANY = RESULTS_DIR / f"{model_name.lower()}_rfmid_best_any_abnormal.pth"
 
     print(f"🚀 Starting {pretty} training with Sens/Spec tracking + AUC threshold calibration")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     train_labels = pd.read_csv(DATA_DIR / "2. Groundtruths" / "a. RFMiD_Training_Labels.csv")
     val_labels = pd.read_csv(DATA_DIR / "2. Groundtruths" / "b. RFMiD_Validation_Labels.csv")
@@ -504,7 +512,10 @@ def run_for_model(model_name: str):
     val_dataset   = RFMiDDataset(DATA_DIR / "1. Original Images" / "b. Validation Set", val_labels, label_columns, val_test_transform)
     test_dataset  = RFMiDDataset(DATA_DIR / "1. Original Images" / "c. Testing Set", test_labels, label_columns, val_test_transform)
 
-    train_loader = DataLoader(train_dataset, BATCH_SIZE, True,  num_workers=NUM_WORKERS)
+    # Deterministic shuffling with a seeded generator so runs are reproducible
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, generator=g)
     val_loader   = DataLoader(val_dataset,   BATCH_SIZE, False, num_workers=NUM_WORKERS)
     test_loader  = DataLoader(test_dataset,  BATCH_SIZE, False, num_workers=NUM_WORKERS)
 
@@ -538,7 +549,7 @@ def run_for_model(model_name: str):
     # Epoch 0: initial evaluation
     print("\n📊 Epoch 0: Evaluating initial model performance...")
     train_loss_0, train_bal_acc_0, train_sens_0, train_spec_0, *_, = evaluate_model(model, train_loader, criterion, device)
-    val_loss_0, val_bal_acc_0, val_sens_0, val_spec_0, val_auc_0, _, _, _, _, val_sens_per_class_0, val_spec_per_class_0 = evaluate_model(model, val_loader, criterion, device)
+    val_loss_0, val_bal_acc_0, val_sens_0, val_spec_0, val_auc_0, _, _, _, _, _, val_sens_per_class_0, val_spec_per_class_0 = evaluate_model(model, val_loader, criterion, device)
 
     train_losses.append(train_loss_0); val_losses.append(val_loss_0)
     train_accs.append(train_bal_acc_0); val_accs.append(val_bal_acc_0)
@@ -560,7 +571,7 @@ def run_for_model(model_name: str):
     epochs_no_improve = 0
     
     # Mixed precision scaler
-    scaler = torch.amp.GradScaler(device_type='cuda', enabled=torch.cuda.is_available())
+    scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
 
     for epoch in range(1, EPOCHS + 1):
         print(f"\nEpoch {epoch}/{EPOCHS}")
@@ -656,7 +667,13 @@ def run_for_model(model_name: str):
 
     if os.path.exists(SAVE_PATH_ANY):
         checkpoint_any = torch.load(SAVE_PATH_ANY, map_location=device)
-        model.load_state_dict(checkpoint_any['model_state_dict'])
+        # Unwrap if temperature wrapper is active, then load into base and rewrap
+        if hasattr(model, 'base'):
+            base = model.base
+            base.load_state_dict(checkpoint_any['model_state_dict'])
+            model = _WithTemp(base, T).to(device)
+        else:
+            model.load_state_dict(checkpoint_any['model_state_dict'])
         print("✅ Loaded best any-abnormal model for overall metrics.")
         _, _, _, _, _, _, _, _, y_true_val_anyCkpt, y_pred_val_anyCkpt, _, _ = evaluate_model(model, val_loader, criterion, device)
         y_true_any_val_ckpt  = (np.sum(y_true_val_anyCkpt, axis=1) > 0).astype(np.int32)
@@ -846,10 +863,10 @@ def generate_all_hybrid_overall_metrics():
                 "checkpoint_name": "coatnet0_rfmid_best.pth",
                 "metrics_name": "coatnet0_metrics.csv",
             },
-            "CMTTiny": {
-                "model_name": "cmt_tiny",
-                "checkpoint_name": "cmt_tiny_rfmid_best.pth",
-                "metrics_name": "cmt_tiny_metrics.csv",
+            "MaxViTTiny": {
+                "model_name": "maxvit_tiny",
+                "checkpoint_name": "maxvit_tiny_rfmid_best.pth",
+                "metrics_name": "maxvit_tiny_metrics.csv",
             },
         }
         
@@ -1051,8 +1068,8 @@ if __name__ == "__main__":
             print("\n❌ FAILED!")
             print("Please check the error messages above.")
     else:
-        # Train both hybrid models
-        model_names = ["coatnet0", "cmt_tiny"]
+        # Train selected hybrid models
+        model_names = ["coatnet0", "maxvit_tiny"]
         for m in model_names:
             print(f"\n==================== {m.upper()} ====================")
             run_for_model(m)

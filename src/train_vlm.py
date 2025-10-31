@@ -32,7 +32,8 @@ import matplotlib.pyplot as plt
 # ----------------------
 # Hard-coded parameters
 # ----------------------
-SEED, BATCH_SIZE, EPOCHS, NUM_WORKERS = 42, 16, 20, 0  # NUM_WORKERS=0 is macOS-safe
+SEED, BATCH_SIZE, EPOCHS, NUM_WORKERS = 42, 4, 20, 0  # NUM_WORKERS=0 is macOS-safe
+ACCUM_STEPS = 4
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 # ----------------------
@@ -106,6 +107,7 @@ def vlm_transforms(model_name: str, train: bool):
     model_name = model_name.lower()
     
     if "clip" in model_name:
+        # OpenCLIP-aligned transforms without instantiating a model (avoid double load)
         size = 336 if "336" in model_name else 224
         aug = [
             transforms.RandomResizedCrop(size, scale=(0.9, 1.0), interpolation=InterpolationMode.BICUBIC),
@@ -126,9 +128,36 @@ def vlm_transforms(model_name: str, train: bool):
     
     elif "siglip" in model_name:
         # Use timm's official config (with caching to avoid rebuilding)
-        timm_name = "siglip_base_patch16_384" if "384" in model_name else "siglip_base_patch16_224"
+        # Handle different naming across timm versions by trying common aliases
+        if "large" in model_name:
+            candidates = [
+                "vit_large_patch16_siglip_384",  # common
+                "siglip_large_patch16_384",      # older/alternate
+                "vit_large_patch16_siglip_224",
+                "siglip_large_patch16_224",
+            ]
+        else:
+            candidates = [
+                "vit_base_patch16_siglip_384",
+                "siglip_base_patch16_384",
+                "vit_base_patch16_siglip_224",
+                "siglip_base_patch16_224",
+            ]
+
+        timm_name = None
+        tmp = None
+        for name in candidates:
+            try:
+                tmp = timm.create_model(name, pretrained=True, num_classes=0)
+                timm_name = name
+                break
+            except Exception:
+                continue
+        if timm_name is None:
+            available = [m for m in timm.list_models("*siglip*")]
+            raise RuntimeError(f"No matching SigLIP model found among {candidates}. Available: {available}")
+
         if timm_name not in _SIGLIP_CFG_CACHE:
-            tmp = timm.create_model(timm_name, pretrained=True, num_classes=0)
             _SIGLIP_CFG_CACHE[timm_name] = timm.data.resolve_data_config({}, model=tmp)
         cfg = _SIGLIP_CFG_CACHE[timm_name]
         return timm.data.create_transform(**cfg, is_training=train)
@@ -143,16 +172,19 @@ def build_model(model_name, num_classes, class_names):
     """Return CLIP or SigLIP model for RFMiD classification"""
     model_name = model_name.lower()
     
-    if "clip" in model_name:
+    if "biomedclip" in model_name or "clip" in model_name:
         # CLIP via OpenCLIP
-        if "336" in model_name:
-            clip_name = "ViT-L-14-336"
-        elif "b16" in model_name or "vit-b/16" in model_name:
-            clip_name = "ViT-B-16"
+        if "biomedclip" in model_name:
+            clip_name = "ViT-L-14"
+            base, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained="biomedclip")
         else:
-            clip_name = "ViT-B-16"  # safe default
-        
-        base, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained="openai")
+            if "336" in model_name:
+                clip_name = "ViT-L-14-336"
+            elif "b16" in model_name or "vit-b/16" in model_name:
+                clip_name = "ViT-B-16"
+            else:
+                clip_name = "ViT-B-16"  # safe default
+            base, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained="openai")
         print(f"✅ Loaded CLIP {clip_name}")
         
         # Safer freeze strategy: freeze all first, then unfreeze vision
@@ -166,10 +198,37 @@ def build_model(model_name, num_classes, class_names):
         return wrapper
         
     elif "siglip" in model_name:
-        # SigLIP
-        timm_name = "siglip_base_patch16_384" if "384" in model_name else "siglip_base_patch16_224"
-        backbone = timm.create_model(timm_name, pretrained=True, num_classes=0)
-        print(f"✅ Loaded SigLIP {timm_name}")
+        # SigLIP (handle naming differences across timm versions)
+        if "large" in model_name:
+            candidates = [
+                "vit_large_patch16_siglip_384",
+                "siglip_large_patch16_384",
+                "vit_large_patch16_siglip_224",
+                "siglip_large_patch16_224",
+            ]
+        else:
+            candidates = [
+                "vit_base_patch16_siglip_384",
+                "siglip_base_patch16_384",
+                "vit_base_patch16_siglip_224",
+                "siglip_base_patch16_224",
+            ]
+        backbone = None
+        last_err = None
+        for name in candidates:
+            try:
+                backbone = timm.create_model(name, pretrained=True, num_classes=0)
+                print(f"✅ Loaded SigLIP {name}")
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if backbone is None:
+            available = [m for m in timm.list_models("*siglip*")]
+            raise RuntimeError(f"Could not create SigLIP model from {candidates}. Available: {available}. Last error: {last_err}")
+        # Default: freeze backbone; we'll selectively unfreeze later at runtime
+        for p in backbone.parameters():
+            p.requires_grad = False
         return SigLIPWrapper(backbone, class_names)
     
     else:
@@ -186,6 +245,8 @@ class CLIPWrapper(nn.Module):
         with torch.no_grad():
             init = base_model.logit_scale.exp().clamp(1.0, 100.0).log()
         self.logit_scale = nn.Parameter(init.clone())
+        # Per-class bias to allow class-specific calibration when encoders are frozen
+        self.class_bias = nn.Parameter(torch.zeros(len(class_names), dtype=torch.float32))
         
         self.class_names = class_names
         self.register_buffer("cached_text_embeds", torch.empty(0), persistent=True)  # placeholder - will be resized in cache_prompts
@@ -339,10 +400,14 @@ class CLIPWrapper(nn.Module):
     def forward(self, x):
         device = x.device
         self.cache_prompts(device)
+        # Clamp logit scale to a safe range to avoid runaway temperatures
+        with torch.no_grad():
+            self.logit_scale.data.clamp_(math.log(1.0), math.log(100.0))
         img = self.base_model.encode_image(x)  # pooled & projected
         img = img / img.norm(dim=-1, keepdim=True)
         txt = self.cached_text_embeds.to(device)
         logits = self.logit_scale.exp() * (img @ txt.T)
+        logits = logits + self.class_bias  # broadcast per-class bias
         return logits
 
 # ----------------------
@@ -366,6 +431,32 @@ class SigLIPWrapper(nn.Module):
     def forward(self, x):
         features = self.backbone(x)
         return self.classifier(features)
+
+# ----------------------
+# Stage-wise fine-tuning helpers
+# ----------------------
+def freeze_all(model):
+    for p in model.parameters():
+        p.requires_grad = False
+
+def unfreeze_last_vit_blocks(model, n_blocks=2):
+    # Works for both CLIP visual.transformer and timm ViT
+    blocks = None
+    if isinstance(model, CLIPWrapper):
+        blocks = list(model.base_model.visual.transformer.resblocks)
+    elif isinstance(model, SigLIPWrapper):
+        # For timm ViT-like backbones
+        if hasattr(model.backbone, "blocks"):
+            blocks = list(model.backbone.blocks)
+        elif hasattr(model.backbone, "stages"):
+            # fallback if SigLIP uses stages
+            blocks = []
+            for s in model.backbone.stages:
+                if hasattr(s, "blocks"): blocks.extend(list(s.blocks))
+    if blocks:
+        for b in blocks[-n_blocks:]:
+            for p in b.parameters():
+                p.requires_grad = True
 
 # ----------------------
 # Temperature scaling (same as before)
@@ -392,11 +483,17 @@ def _gather_val_logits_labels(model, loader, device):
 
 def fit_temperature(model, val_loader, device):
     logits, labels = _gather_val_logits_labels(model, val_loader, device)
-    scaler = _TempScaler(init_T=1.0).to(device)
+    # Move optimization to CPU unless CUDA is available; L-BFGS is often more stable on CPU
+    if device.type != "cuda":
+        logits, labels = logits.cpu(), labels.cpu()
+        dev = torch.device("cpu")
+    else:
+        dev = device
+    scaler = _TempScaler(init_T=1.0).to(dev)
     optimizer = torch.optim.LBFGS(scaler.parameters(), lr=0.1, max_iter=50, line_search_fn="strong_wolfe")
     criterion = nn.BCEWithLogitsLoss(reduction="mean")
     
-    logits, labels = logits.to(device), labels.to(device)
+    logits, labels = logits.to(dev), labels.to(dev)
     
     def closure():
         optimizer.zero_grad()
@@ -451,38 +548,57 @@ def compute_f1_at_thresholds(all_labels, all_preds, thresholds=None):
 # ----------------------
 # Train/Eval routines (same structure as train_hybrid.py)
 # ----------------------
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler):
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler, accum_steps=4):
     model.train()
     running_loss = 0.0
-    
     TP = TN = FP = FN = None
-    pbar = tqdm(loader, desc="Training", leave=False)
-    for images, labels in pbar:
+    optimizer.zero_grad(set_to_none=True)
+
+    device_type = device.type  # 'cuda', 'mps', or 'cpu'
+    for step, (images, labels) in enumerate(tqdm(loader, desc="Training", leave=False), 1):
         images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        
-        with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+
+        with torch.amp.autocast(device_type=device_type, enabled=(device_type in ["cuda", "mps"])):
             logits = model(images)
-            loss = criterion(logits, labels)
-        
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        running_loss += loss.item()
-        
+            loss = criterion(logits, labels) / accum_steps
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            if step % accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        else:
+            loss.backward()
+            if step % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        running_loss += loss.item() * accum_steps
+
         preds = (torch.sigmoid(logits) > 0.5).float()
-        tp = (preds * labels).sum(dim=0)
-        tn = ((1 - preds) * (1 - labels)).sum(dim=0)
-        fp = (preds * (1 - labels)).sum(dim=0)
-        fn = ((1 - preds) * labels).sum(dim=0)
-        
+        tp = (preds * labels).sum(dim=0); tn = ((1 - preds) * (1 - labels)).sum(dim=0)
+        fp = (preds * (1 - labels)).sum(dim=0); fn = ((1 - preds) * labels).sum(dim=0)
         if TP is None:
             TP, TN, FP, FN = tp, tn, fp, fn
         else:
             TP += tp; TN += tn; FP += fp; FN += fn
-    
+
+    # Final optimizer step for remaining gradient accumulation tail
+    if (step % accum_steps) != 0:
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
     sens = (TP.sum() / (TP.sum() + FN.sum() + 1e-6)).item()
     spec = (TN.sum() / (TN.sum() + FP.sum() + 1e-6)).item()
     bal_acc = 0.5 * (sens + spec)
@@ -511,18 +627,19 @@ def evaluate_model(model, loader, criterion, device, thresholds=None):
         else:
             preds = (probs > thresholds).astype(float)
         
-        preds_t = torch.tensor(preds)
-        labels_t = torch.tensor(labels_np)
-        
-        tp = (preds_t * labels_t).sum(dim=0)
-        tn = ((1 - preds_t) * (1 - labels_t)).sum(dim=0)
-        fp = (preds_t * (1 - labels_t)).sum(dim=0)
-        fn = ((1 - preds_t) * labels_t).sum(dim=0)
+        # Compute confusion components in NumPy to avoid unnecessary CPU<->Torch churn
+        tp = (preds * labels_np).sum(axis=0)
+        tn = ((1 - preds) * (1 - labels_np)).sum(axis=0)
+        fp = (preds * (1 - labels_np)).sum(axis=0)
+        fn = ((1 - preds) * labels_np).sum(axis=0)
         
         if TP is None:
-            TP, TN, FP, FN = tp, tn, fp, fn
+            TP = torch.tensor(tp)
+            TN = torch.tensor(tn)
+            FP = torch.tensor(fp)
+            FN = torch.tensor(fn)
         else:
-            TP += tp; TN += tn; FP += fp; FN += fn
+            TP += torch.tensor(tp); TN += torch.tensor(tn); FP += torch.tensor(fp); FN += torch.tensor(fn)
         
         all_preds.append(probs)
         all_labels.append(labels_np)
@@ -629,9 +746,7 @@ def run_for_model(model_name: str):
 
     pretty = {
         "clip_vit_b16": "CLIPViTB16",
-        "clip_vit_l14_336": "CLIPViTL14336",
-        "siglip_base": "SigLIPBase",
-        "siglip_large": "SigLIPLarge",
+        "siglip_base_384": "SigLIPBase384",
     }[model_name.lower()]
 
     RESULTS_DIR = ROOT_DIR / "results" / "VLM" / pretty
@@ -642,7 +757,12 @@ def run_for_model(model_name: str):
     SAVE_PATH_ANY = RESULTS_DIR / f"{model_name.lower()}_rfmid_best_any_abnormal.pth"
 
     print(f"🚀 Starting {pretty} training with Sens/Spec tracking + AUC threshold calibration")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     train_labels = pd.read_csv(DATA_DIR / "2. Groundtruths" / "a. RFMiD_Training_Labels.csv")
     val_labels = pd.read_csv(DATA_DIR / "2. Groundtruths" / "b. RFMiD_Validation_Labels.csv")
@@ -670,8 +790,26 @@ def run_for_model(model_name: str):
     test_dataset  = RFMiDDataset(DATA_DIR / "1. Original Images" / "c. Testing Set", test_labels, label_columns, val_test_transform)
 
     pin = torch.cuda.is_available()
-    train_loader = DataLoader(train_dataset, BATCH_SIZE, True,  num_workers=NUM_WORKERS,
-                              pin_memory=pin, persistent_workers=NUM_WORKERS>0)
+    # Toggle for using weighted sampler; default False to avoid double-weighting with pos_weight
+    USE_WEIGHTED_SAMPLER = False
+    if USE_WEIGHTED_SAMPLER:
+        # Safer sampler: give all examples a base weight, boost positives by rarity
+        cls_freq = train_labels[label_columns].sum(axis=0) + 1e-6
+        per_cls_w = (len(train_labels) - cls_freq) / cls_freq
+        ex_w = (train_labels[label_columns].values * per_cls_w.values).sum(axis=1)
+        ex_w = np.asarray(ex_w, dtype=np.float64)
+        ex_w = ex_w + 1.0  # base weight so all-negative samples still get sampled
+        sampler = torch.utils.data.WeightedRandomSampler(
+            torch.tensor(ex_w, dtype=torch.double), len(ex_w), replacement=True
+        )
+        train_loader = DataLoader(train_dataset, BATCH_SIZE, sampler=sampler, num_workers=NUM_WORKERS,
+                                  pin_memory=pin, persistent_workers=NUM_WORKERS>0)
+    else:
+        # Deterministic shuffling with a seeded generator
+        g = torch.Generator()
+        g.manual_seed(SEED)
+        train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
+                                  generator=g, pin_memory=pin, persistent_workers=NUM_WORKERS>0)
     val_loader   = DataLoader(val_dataset,   BATCH_SIZE, False, num_workers=NUM_WORKERS,
                               pin_memory=pin, persistent_workers=NUM_WORKERS>0)
     test_loader  = DataLoader(test_dataset,  BATCH_SIZE, False, num_workers=NUM_WORKERS,
@@ -679,27 +817,39 @@ def run_for_model(model_name: str):
 
     # Build model and criterion
     model = build_model(model_name, num_classes=len(label_columns), class_names=label_columns).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # Avoid double-weighting: if sampler is enabled, drop pos_weight
+    criterion = nn.BCEWithLogitsLoss(pos_weight=None if USE_WEIGHTED_SAMPLER else pos_weight)
 
-    # Optimizer/scheduler for VLM models - adjust param groups based on model type
+    # ---------------- Stage-wise LR: Stage 1 (freeze, train small head) ----------------
+    freeze_all(model)
     if isinstance(model, CLIPWrapper):
-        # CLIP: tune vision encoder + logit scale
-        params = [
-            {"params": model.base_model.visual.parameters(), "lr": 5e-5, "weight_decay": 0.05},
-            {"params": [model.logit_scale], "lr": 1e-4, "weight_decay": 0.0},
+        # Only train logit_scale in stage 1
+        for p in model.base_model.visual.parameters():
+            p.requires_grad = False
+        # Re-enable grad for logit_scale after global freeze
+        if hasattr(model, "logit_scale"):
+            model.logit_scale.requires_grad = True
+        if hasattr(model, "class_bias"):
+            model.class_bias.requires_grad = True
+        stage1_params = [
+            {"params": [model.logit_scale, model.class_bias], "lr": 1e-4, "weight_decay": 0.0},
         ]
     elif isinstance(model, SigLIPWrapper):
-        # SigLIP: standard backbone + classifier
-        params = [
-            {"params": model.backbone.parameters(), "lr": 5e-5, "weight_decay": 0.05},
+        # Only train classifier head in stage 1
+        for p in model.classifier.parameters():
+            p.requires_grad = True
+        stage1_params = [
             {"params": model.classifier.parameters(), "lr": 5e-4, "weight_decay": 0.0},
         ]
     else:
-        # Fallback for any other wrapper types
-        params = [{"params": model.parameters(), "lr": 5e-5, "weight_decay": 0.05}]
-    
-    optimizer = torch.optim.AdamW(params)
+        stage1_params = [{"params": model.parameters(), "lr": 5e-5, "weight_decay": 0.05}]
+
+    optimizer = torch.optim.AdamW(stage1_params)
     scheduler = cosine_with_warmup(optimizer, warmup_epochs=5, total_epochs=EPOCHS)
+
+    # Epoch to switch to stage 2 (unfreeze last ViT blocks)
+    UNFREEZE_EPOCH = 5
+    UNFREEZE_BLOCKS = 4
 
     # CSV header with per-class columns
     class_names = label_columns
@@ -717,7 +867,7 @@ def run_for_model(model_name: str):
     # Epoch 0: initial evaluation
     print("\n📊 Epoch 0: Evaluating initial model performance...")
     train_loss_0, train_bal_acc_0, train_sens_0, train_spec_0, *_, = evaluate_model(model, train_loader, criterion, device)
-    val_loss_0, val_bal_acc_0, val_sens_0, val_spec_0, val_auc_0, _, _, _, _, val_sens_per_class_0, val_spec_per_class_0 = evaluate_model(model, val_loader, criterion, device)
+    val_loss_0, val_bal_acc_0, val_sens_0, val_spec_0, val_auc_0, _, _, _, _, _, val_sens_per_class_0, val_spec_per_class_0 = evaluate_model(model, val_loader, criterion, device)
 
     train_losses.append(train_loss_0); val_losses.append(val_loss_0)
     train_accs.append(train_bal_acc_0); val_accs.append(val_bal_acc_0)
@@ -738,12 +888,38 @@ def run_for_model(model_name: str):
     best_val_auc_es = -1.0
     epochs_no_improve = 0
     
-    # Mixed precision scaler
-    scaler = torch.amp.GradScaler(device_type='cuda', enabled=torch.cuda.is_available())
+    # Mixed precision scaler (CUDA only)
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
 
     for epoch in range(1, EPOCHS + 1):
         print(f"\nEpoch {epoch}/{EPOCHS}")
-        train_loss, train_bal_acc, train_sens, train_spec = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
+
+        # ---------------- Stage switch to Stage 2 ----------------
+        if epoch == UNFREEZE_EPOCH:
+            unfreeze_last_vit_blocks(model, n_blocks=UNFREEZE_BLOCKS)
+            if isinstance(model, CLIPWrapper):
+                params = [
+                    {"params": [model.logit_scale, model.class_bias], "lr": 1e-4, "weight_decay": 0.0},
+                ]
+                last_blocks = list(model.base_model.visual.transformer.resblocks)[-UNFREEZE_BLOCKS:]
+                block_params = []
+                for b in last_blocks:
+                    block_params += [p for p in b.parameters() if p.requires_grad]
+                params.append({"params": block_params, "lr": 1e-5, "weight_decay": 0.05})
+            else:  # SigLIPWrapper
+                params = [
+                    {"params": model.classifier.parameters(), "lr": 5e-4, "weight_decay": 0.0},
+                ]
+                if hasattr(model.backbone, "blocks"):
+                    last_blocks = list(model.backbone.blocks)[-UNFREEZE_BLOCKS:]
+                    block_params = []
+                    for b in last_blocks:
+                        block_params += [p for p in b.parameters() if p.requires_grad]
+                    params.append({"params": block_params, "lr": 1e-5, "weight_decay": 0.05})
+            optimizer = torch.optim.AdamW(params)
+            scheduler = cosine_with_warmup(optimizer, warmup_epochs=2, total_epochs=max(3, EPOCHS - UNFREEZE_EPOCH))
+            print(f"🔓 Unfroze last {UNFREEZE_BLOCKS} ViT blocks with LR=1e-5 (head/logit_scale kept higher LR)")
+        train_loss, train_bal_acc, train_sens, train_spec = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, accum_steps=ACCUM_STEPS)
         val_loss, val_bal_acc, val_sens, val_spec, val_auc, val_auc_micro, val_macro_f1, val_micro_f1, y_true_val_all, y_pred_val_all, val_sens_per_class, val_spec_per_class = evaluate_model(model, val_loader, criterion, device)
 
         scheduler.step()
@@ -1015,8 +1191,8 @@ if __name__ == "__main__":
         print("❌ Metrics generation not yet implemented for VLM models.")
         print("Train models first, then implement generate_all_vlm_overall_metrics().")
     else:
-        # Train both VLM models
-        model_names = ["clip_vit_b16", "siglip_base"]
+        # Train selected smaller VLM models
+        model_names = ["clip_vit_b16", "siglip_base_384"]
         for m in model_names:
             print(f"\n==================== {m.upper()} ====================")
             run_for_model(m)
