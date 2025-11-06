@@ -186,6 +186,17 @@ Retinal-NeuralNET/
 
 ## 📊 Output Files
 
+### **All Result Files**
+All experimental results, including metrics, visualizations, and model outputs, are available on Google Drive:
+- **[📁 Google Drive - All Results](https://drive.google.com/drive/folders/1Byk7Ed1bdLxRA3dFDVTSatcHs2uXBiNj?usp=sharing)**
+
+The Drive contains organized folders for:
+- **CNN**: Results from all CNN architectures (ResNet50, DenseNet121, InceptionV3, EfficientNet-B3)
+- **Hybrid**: Results from hybrid architectures (CoAtNet0, MaxViTTiny)
+- **ViT**: Results from Vision Transformer models (ViTSmall, DeiTSmall, SwinTiny, CrossViTSmall)
+- **VLM**: Results from Vision-Language Models (CLIPViTB16, SigLIPBase384)
+- **Comparison Documents**: ViT vs Hybrid comparison analysis
+
 ### **Per-Model Results**
 Each CNN architecture generates:
 - **Model Checkpoint**: Best performing model (`.pth`)
