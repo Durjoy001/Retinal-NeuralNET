@@ -1,0 +1,13 @@
+Metric,Value
+AUC (%),96.6300
+Threshold@0.80spec,0.759935
+Precision@Thr,97.3085
+Recall@Thr (%),92.8854
+TP,470
+TN,121
+FP,13
+FN,36
+F1max,0.953141
+F1max_Threshold,0.711696
+F1max_Precision,96.1771
+F1max_Recall (%),94.4664

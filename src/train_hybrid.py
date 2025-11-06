@@ -109,7 +109,8 @@ def vit_transforms(model_name: str, train: bool):
     # Map model names to timm model identifiers
     model_map = {
         "coatnet0": "coatnet_0_rw_224.sw_in1k",
-        "maxvit_tiny": "maxvit_tiny_rw_256",
+        # Switch to TF-pretrained MaxViT Tiny variant that ships weights
+        "maxvit_tiny": "maxvit_tiny_tf_224",
     }
     
     if model_name not in model_map:
@@ -135,8 +136,8 @@ def build_model(model_name, num_classes):
         in_f = backbone.num_features
         
     elif model_name == "maxvit_tiny":
-        # MaxViT-Tiny (256): hybrid attention architecture
-        backbone = timm.create_model('maxvit_tiny_rw_256', pretrained=True, num_classes=0, drop_path_rate=0.2)
+        # MaxViT-Tiny (224 TF): hybrid attention architecture with available pretrained weights
+        backbone = timm.create_model('maxvit_tiny_tf_224', pretrained=True, num_classes=0, drop_path_rate=0.2)
         in_f = backbone.num_features
         
     else:
