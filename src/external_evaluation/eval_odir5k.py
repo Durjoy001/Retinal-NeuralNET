@@ -4,9 +4,10 @@
 # - Can apply RFMiD per-class threshold for Disease_Risk (from optimal_thresholds.npy)
 #   or recalibrate a threshold on a small ODIR holdout (no weight updates).
 
-import os, argparse
+import os, argparse, random
 from pathlib import Path
 from collections import defaultdict
+from typing import Dict, List
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -14,6 +15,7 @@ from PIL import Image
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
 
 import timm
 from timm.data import resolve_data_config
@@ -107,6 +109,80 @@ class ODIRAnyAbnDataset(Dataset):
             return img, int(s["label"])
         except Exception as e:
             raise RuntimeError(f"Failed to load image {s['img_path']}: {e}")
+
+# ----------------------
+# RFMiD to ODIR label mapping
+# ----------------------
+def build_odir_mapping(rfmid_labels: List[str]) -> Dict[str, List[int]]:
+    """
+    Return indices of RFMiD labels that correspond to each ODIR class:
+    ODIR: D (DR), G (Glaucoma), C (Cataract), A (AMD),
+          H (Hypertension), M (Myopia), O (Other)
+    
+    Concrete mapping based on RFMiD label names:
+    D (DR): DR
+    G (Glaucoma): ODC (optic disc cupping)
+    C (Cataract): none present in RFMiD (intentionally empty)
+    A (AMD): ARMD, RPEC (RPE changes; often AMD-related)
+    H (Hypertension): AH (arterial hypertension), TV (tortuous vessels), ODE (optic disc edema)
+    M (Myopia): MYA (myopia), TSLN (tessellated fundus), ST (staphyloma)
+    O (Other): everything else that isn't in the sets above
+    """
+    # Build index lookup for all RFMiD labels
+    idx = {name: rfmid_labels.index(name) for name in rfmid_labels}
+    
+    mapping = {
+        "D": [idx["DR"]],
+        "G": [idx["ODC"]],
+        "C": [],  # no Cataract label in RFMiD (intentionally empty)
+        "A": [idx["ARMD"], idx["RPEC"]],
+        "H": [idx["AH"], idx["TV"], idx["ODE"]],
+        "M": [idx["MYA"], idx["TSLN"], idx["ST"]],
+    }
+    
+    # O (Other): all remaining labels except ID and Disease_Risk
+    used = set(sum(mapping.values(), []))
+    others = [i for i, name in enumerate(rfmid_labels) 
+              if name not in ("ID", "Disease_Risk") and i not in used]
+    mapping["O"] = others
+    
+    return mapping
+
+def noisyor_over_indices(probs, indices):
+    """Noisy-OR pooling over specific indices"""
+    # probs: [B, C], indices: list[int]
+    if not indices: 
+        return np.zeros((probs.shape[0],), dtype=np.float32)
+    p = np.clip(probs[:, indices], 1e-6, 1 - 1e-6)
+    return 1.0 - np.prod(1.0 - p, axis=1)
+
+# ----------------------
+# Temperature Scaling
+# ----------------------
+def fit_temperature_binary(logits_np, y_np):
+    """
+    Fit a single temperature parameter T for binary calibration.
+    logits_np: shape [N]  (use the logit you will threshold on: drisk or odir_map pooled *logit*)
+    y_np:      shape [N] in {0,1}
+    Returns scalar temperature T>0
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    l = torch.tensor(logits_np, dtype=torch.float32, device=device).view(-1, 1)
+    y = torch.tensor(y_np, dtype=torch.float32, device=device).view(-1, 1)
+
+    T = nn.Parameter(torch.ones(1, device=device))
+    criterion = nn.BCEWithLogitsLoss()
+
+    optimizer = optim.LBFGS([T], lr=0.5, max_iter=50, line_search_fn="strong_wolfe")
+
+    def closure():
+        optimizer.zero_grad()
+        loss = criterion(l / T.clamp_min(1e-3), y)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return float(T.detach().cpu().item())
 
 # ----------------------
 # Pooling strategies for Any-Abnormal when Disease_Risk is absent
@@ -262,15 +338,39 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
         print(f"  ✅ Disease_Risk found at index {drisk_idx} (will use for any-abnormal pooling)")
 
     # Decide pooling behavior
+    # For ODIR-5K evaluation, prefer odir_map to align semantic space between RFMiD and ODIR
     if pooling == "auto":
-        pooling_mode = "drisk" if has_drisk else "noisyor"
-        print(f"  Pooling mode: {pooling_mode} (auto-selected)")
+        # Prefer odir_map for ODIR-5K (aligns RFMiD→ODIR semantic space)
+        # Fallback to drisk if mapping fails, then noisyor
+        pooling_mode = "odir_map"  # Always prefer mapping for ODIR evaluation
+        print(f"  Pooling mode: {pooling_mode} (auto-selected for ODIR-5K: aligns RFMiD→ODIR semantic space)")
     else:
         pooling_mode = pooling
         print(f"  Pooling mode: {pooling_mode} (user-specified)")
         # Validate that Disease_Risk exists if user forces "drisk" mode
         if pooling_mode == "drisk" and not has_drisk:
             raise ValueError(f"Disease_Risk not found in RFMiD labels, but pooling='drisk' was requested. Available labels: {rfmid_labels[:5]}...")
+    
+    # Build ODIR mapping if using odir_map pooling
+    odir_mapping = None
+    if pooling_mode == "odir_map":
+        odir_mapping = build_odir_mapping(rfmid_labels)
+        # Fail fast if any ODIR class (except "C" which is intentionally empty) has no matching RFMiD classes
+        missing = [k for k, v in odir_mapping.items() if len(v) == 0 and k != "C"]
+        if missing:
+            raise ValueError(
+                f"RFMiD→ODIR mapping has empty classes: {missing}. "
+                f"Check build_odir_mapping() against your RFMiD column names. "
+                f"Available RFMiD labels: {rfmid_labels[:10]}..."
+            )
+        total_mapped = sum(len(v) for v in odir_mapping.values())
+        print(f"  ✅ Built RFMiD→ODIR mapping ({total_mapped} RFMiD classes mapped):")
+        for k, v in odir_mapping.items():
+            if v:
+                mapped_names = [rfmid_labels[i] for i in v[:3]]  # Show first 3
+                print(f"    {k}: {len(v)} RFMiD classes -> {mapped_names}{'...' if len(v) > 3 else ''}")
+            elif k == "C":
+                print(f"    {k}: 0 RFMiD classes (intentionally empty - no Cataract label in RFMiD)")
 
     # Optional RFMiD threshold (Disease_Risk only)
     rfmid_thr = None
@@ -282,17 +382,41 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
         else:
             print("  ⚠️ Disease_Risk not available in thresholds; skipping fixed RFMiD threshold.")
 
-    def collect_scores(loader, dataset_name="data"):
-        y_true, y_score = [], []
+    def collect_scores(loader, dataset_name="data", temperature=None, return_logits=False):
+        """
+        Collect scores (and optionally logits) from model inference.
+        If temperature is provided, scales logits before computing probabilities.
+        """
+        y_true, y_score, all_logits = [], [], []
         total_batches = len(loader)
         print(f"  Running inference on {len(loader.dataset)} {dataset_name} images ({total_batches} batches)...")
         with torch.inference_mode():
             for batch_idx, (x, y) in enumerate(loader, 1):
                 x = x.to(device)
                 logits = model(x)
+                
+                # Apply temperature scaling if provided
+                if temperature is not None and temperature != 1.0:
+                    logits = logits / max(float(temperature), 1e-3)
+                
+                # Store logits if requested
+                if return_logits:
+                    all_logits.append(logits.cpu().numpy())
+                
                 probs = torch.sigmoid(logits).cpu().numpy()  # [B, C]
                 if pooling_mode == "drisk":
                     pooled = probs[:, drisk_idx]
+                elif pooling_mode == "odir_map":
+                    # Map RFMiD -> ODIR classes, then Any-Abn across 7
+                    p_D = noisyor_over_indices(probs, odir_mapping["D"])
+                    p_G = noisyor_over_indices(probs, odir_mapping["G"])
+                    p_C = noisyor_over_indices(probs, odir_mapping["C"])
+                    p_A = noisyor_over_indices(probs, odir_mapping["A"])
+                    p_H = noisyor_over_indices(probs, odir_mapping["H"])
+                    p_M = noisyor_over_indices(probs, odir_mapping["M"])
+                    p_O = noisyor_over_indices(probs, odir_mapping["O"])
+                    odir_vec = np.stack([p_D, p_G, p_C, p_A, p_H, p_M, p_O], axis=1)  # [B,7]
+                    pooled = 1.0 - np.prod(1.0 - np.clip(odir_vec, 1e-6, 1-1e-6), axis=1)  # Any-Abn across 7
                 elif pooling_mode == "noisyor":
                     pooled = pool_any(probs, mode="noisyor")
                 elif pooling_mode == "max":
@@ -313,24 +437,73 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
         y_true_concat = np.concatenate(y_true)
         y_score_concat = np.concatenate(y_score)
         print(f"  ✅ Inference complete: {len(y_true_concat)} images")
+        
+        if return_logits:
+            logits_concat = np.vstack(all_logits)
+            return y_true_concat, y_score_concat, logits_concat
         return y_true_concat, y_score_concat
 
-    # Calibrate threshold on ODIR (optional)
+    # Calibrate temperature and threshold on ODIR (optional)
     calib_thr = None
+    temperature = None
     if calib_loader is not None:
-        print(f"\n  📊 Calibrating threshold on ODIR calibration set (target: 80% specificity)...")
-        y_c, s_c = collect_scores(calib_loader, "calibration")
+        # Step 1: Fit temperature scaling on calibration logits
+        print(f"\n  🌡️  Fitting temperature scaling on calibration set...")
+        y_c_temp, _, logits_c = collect_scores(calib_loader, "calibration", return_logits=True)
+        
+        # Extract the pooled logit that will be thresholded
+        if pooling_mode == "drisk":
+            l_c_pooled = logits_c[:, drisk_idx]
+        elif pooling_mode == "odir_map":
+            # Compute pooled prob from unscaled logits, then convert to logit
+            probs_c = 1.0 / (1.0 + np.exp(-logits_c))  # sigmoid
+            p_D = noisyor_over_indices(probs_c, odir_mapping["D"])
+            p_G = noisyor_over_indices(probs_c, odir_mapping["G"])
+            p_C = noisyor_over_indices(probs_c, odir_mapping["C"])
+            p_A = noisyor_over_indices(probs_c, odir_mapping["A"])
+            p_H = noisyor_over_indices(probs_c, odir_mapping["H"])
+            p_M = noisyor_over_indices(probs_c, odir_mapping["M"])
+            p_O = noisyor_over_indices(probs_c, odir_mapping["O"])
+            odir_vec = np.stack([p_D, p_G, p_C, p_A, p_H, p_M, p_O], axis=1)
+            pooled_prob = 1.0 - np.prod(1.0 - np.clip(odir_vec, 1e-6, 1-1e-6), axis=1)
+            # Convert pooled prob back to logit
+            l_c_pooled = np.log(np.clip(pooled_prob, 1e-6, 1-1e-6) / np.clip(1 - pooled_prob, 1e-6, 1-1e-6))
+        elif pooling_mode == "noisyor":
+            probs_c = 1.0 / (1.0 + np.exp(-logits_c))
+            pooled_prob = pool_any(probs_c, mode="noisyor")
+            l_c_pooled = np.log(np.clip(pooled_prob, 1e-6, 1-1e-6) / np.clip(1 - pooled_prob, 1e-6, 1-1e-6))
+        elif pooling_mode == "max":
+            probs_c = 1.0 / (1.0 + np.exp(-logits_c))
+            pooled_prob = pool_any(probs_c, mode="max")
+            l_c_pooled = np.log(np.clip(pooled_prob, 1e-6, 1-1e-6) / np.clip(1 - pooled_prob, 1e-6, 1-1e-6))
+        elif pooling_mode == "logitsum":
+            probs_c = 1.0 / (1.0 + np.exp(-logits_c))
+            pooled_prob = pool_any(probs_c, mode="logitsum", T=logitsum_T)
+            l_c_pooled = np.log(np.clip(pooled_prob, 1e-6, 1-1e-6) / np.clip(1 - pooled_prob, 1e-6, 1-1e-6))
+        else:
+            raise ValueError("Unknown pooling mode for temperature scaling")
+        
+        # Fit temperature
+        unique_classes_calib = np.unique(y_c_temp)
+        if len(unique_classes_calib) >= 2:
+            temperature = fit_temperature_binary(l_c_pooled, y_c_temp)
+            print(f"  ✅ Learned temperature T={temperature:.3f}")
+        else:
+            print(f"  ⚠️ Cannot fit temperature: only one class in calibration set")
+        
+        # Step 2: Calibrate threshold on temperature-scaled calibration scores
+        print(f"\n  📊 Calibrating threshold on temperature-scaled calibration set (target: 80% specificity)...")
+        y_c, s_c = collect_scores(calib_loader, "calibration", temperature=temperature)
         # Guard calibration threshold computation
-        unique_classes_calib = np.unique(y_c)
         if len(unique_classes_calib) < 2:
             print(f"  ⚠️ Warning: Only one class in calibration set, cannot compute threshold")
         else:
             calib_thr, spec_at_thr, sens_at_thr = pick_thr_for_specificity(y_c, s_c, target_spec=0.80)
             print(f"  ✅ Calibrated threshold: {calib_thr:.6f} (gives spec={spec_at_thr:.3f}, sens={sens_at_thr:.3f} on calibration set)")
 
-    # Evaluate on test split
+    # Evaluate on test split (with temperature scaling if available)
     print(f"\n  📊 Evaluating on test set...")
-    y_t, s_t = collect_scores(test_loader, "test")
+    y_t, s_t = collect_scores(test_loader, "test", temperature=temperature)
     
     # Map the sampled indices back to sample metadata for patient-level evaluation
     if test_idx is not None:
@@ -427,6 +600,10 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
 
     # Add patient-level metrics to results
     results.update(patient_metrics)
+    
+    # Add temperature scaling info if used
+    if temperature is not None:
+        results["Temperature"] = float(temperature)
 
     return y_t, s_t, results, (calib_idx, test_idx)
 
@@ -434,6 +611,15 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
 # Main
 # ----------------------
 def main(args):
+    # Seed everything for reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     results_root = Path("results") / "External" / "ODIR-5K"
     results_root.mkdir(parents=True, exist_ok=True)
@@ -526,8 +712,8 @@ if __name__ == "__main__":
     p.add_argument("--odir_img_dir", required=True, help="Folder with ODIR training images (contains the Left/Right filenames).")
     p.add_argument("--rfmid_train_csv", required=True, help="Path to RFMiD training labels CSV to get label schema.")
     p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--pooling", choices=["auto","noisyor","max","logitsum","drisk"], default="auto",
-                   help="auto: Disease_Risk if present else Noisy-OR; or force a pooling mode.")
+    p.add_argument("--pooling", choices=["auto","noisyor","max","logitsum","drisk","odir_map"], default="auto",
+                   help="auto: Disease_Risk if present else Noisy-OR; 'odir_map' maps RFMiD classes into ODIR classes before Any-Abn.")
     p.add_argument("--logitsum_T", type=float, default=1.0, help="Temperature for logitsum pooling.")
     p.add_argument("--use_rfmid_thresholds", action="store_true",
                    help="If set, apply RFMiD per-class threshold for Disease_Risk from optimal_thresholds.npy.")
