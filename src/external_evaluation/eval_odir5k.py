@@ -104,10 +104,10 @@ class ODIRAnyAbnDataset(Dataset):
     def __getitem__(self, idx):
         s = self.samples[idx]
         try:
-        img = Image.open(s["img_path"]).convert("RGB")
+            img = Image.open(s["img_path"]).convert("RGB")
             if self.transform:
                 img = self.transform(img)
-        return img, int(s["label"])
+            return img, int(s["label"])
         except Exception as e:
             raise RuntimeError(f"Failed to load image {s['img_path']}: {e}")
 
@@ -699,8 +699,8 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
     # Threshold-based metrics only computed if not single class
     if not single_class:
         print(f"\n  Computing metrics at different thresholds...")
-    thr80, spec80, sens80 = pick_thr_for_specificity(y_t, s_t, target_spec=0.80)
-    results.update(eval_at_thr("Spec80_onTest", thr80))
+        thr80, spec80, sens80 = pick_thr_for_specificity(y_t, s_t, target_spec=0.80)
+        results.update(eval_at_thr("Spec80_onTest", thr80))
         print(f"    Spec80_onTest: threshold={thr80:.6f}, sens={sens80:.3f}, spec={spec80:.3f}")
 
         if rfmid_thr is not None and pooling_mode == "drisk":
@@ -711,7 +711,7 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
         elif rfmid_thr is not None:
             print(f"    ⚠️ Skipping RFMiD_thr metrics because pooling_mode != 'drisk' (threshold not comparable).")
 
-    if calib_thr is not None:
+        if calib_thr is not None:
             calib_metrics = eval_at_thr("ODIR_calib_thr", calib_thr)
             results.update(calib_metrics)
             print(f"    ODIR_calib_thr: threshold={calib_thr:.6f}, sens={calib_metrics['ODIR_calib_thr_Sensitivity']:.3f}, "
@@ -813,7 +813,7 @@ def main(args):
         if 'ODIR_calib_thr_Sensitivity' in metrics:
             print(f"  @ODIR-calib thr: sens={metrics['ODIR_calib_thr_Sensitivity']:.4f} spec={metrics['ODIR_calib_thr_Specificity']:.4f}")
         if 'Spec80_onTest_Sensitivity' in metrics:
-        print(f"  @Spec≈0.80 on test: sens={metrics['Spec80_onTest_Sensitivity']:.4f} thr={metrics['Spec80_onTest_Threshold']:.4f}")
+            print(f"  @Spec≈0.80 on test: sens={metrics['Spec80_onTest_Sensitivity']:.4f} thr={metrics['Spec80_onTest_Threshold']:.4f}")
         else:
             print("  @Spec≈0.80 on test: n/a (single-class test split)")
 
