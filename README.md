@@ -5,12 +5,16 @@ This repository contains a comprehensive deep learning framework for **retinal f
 
 
 [**"ODIR-5k Dataset"**](https://odir2019.grand-challenge.org/dataset/)
+
 [**"Messidor-2 Dataset"**](https://www.kaggle.com/datasets/mariaherrerot/messidor2preprocess)
 
 
 [**"Research Article on Thyroid Nodule Classification"**](https://www.sciencedirect.com/science/article/pii/S1877050924031235)
+
 [**"Evaluating the Performance and Clinical Applications of Multiclass Deep Learning Models for Skin Cancer Pathology Diagnosis (ISIC): A Comparative Analysis of CNN, ViT, and VLM"**](https://dl.acm.org/doi/10.1145/3731763.3731793)
+
 [**"Retinal Fundus Multi-Disease Image Dataset (RFMiD): A Dataset for Multi-Disease Detection Research"**](https://ieee-dataport.org/open-access/retinal-fundus-multi-disease-image-dataset-rfmid)
+
 [**"Comparative Analysis of Vision Transformers and Conventional Convolutional Neural Networks in Detecting Referable Diabetic Retinopathy"**](https://www.ophthalmologyscience.org/article/S2666-9145(24)00088-5/fulltext)
 
 ---
