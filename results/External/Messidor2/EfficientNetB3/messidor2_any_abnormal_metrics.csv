@@ -1,0 +1,17 @@
+Metric,Value
+AUC (%),47.3251
+Threshold,0.421070
+Precision@Thr,32.2188
+Recall@Thr (%),98.1481
+Sensitivity,0.981481
+Specificity,0.008889
+Balanced_Accuracy,0.495185
+Accuracy,0.324324
+TP,106
+TN,2
+FP,223
+FN,2
+F1max,0.490909
+F1max_Threshold,0.411504
+F1max_Precision,32.5301
+F1max_Recall (%),100.0000

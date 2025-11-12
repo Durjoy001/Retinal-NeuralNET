@@ -1,0 +1,19 @@
+Metric,Value
+AUC (%),43.2325
+threshold_used,0.114823
+threshold_type,rfmid
+threshold_rfmid_dr,0.381923
+Precision@Thr,27.9605
+Recall@Thr (%),89.4737
+Sensitivity,0.894737
+Specificity,0.137795
+Balanced_Accuracy,0.516266
+Accuracy,0.343840
+TP,85
+TN,35
+FP,219
+FN,10
+F1max,0.437788
+F1max_Threshold,0.092268
+F1max_Precision,28.0236
+F1max_Recall (%),100.0000
