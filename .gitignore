@@ -3,3 +3,4 @@ __pycache__
 
 # Exclude large model weight files from results
 results/**/*.pth
+/results
