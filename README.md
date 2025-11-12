@@ -2,6 +2,12 @@
 
 This repository contains a comprehensive deep learning framework for **retinal fundus multi-disease detection** using both Convolutional Neural Networks (CNNs) and Vision Transformers (ViTs). The project focuses on comparing different deep learning architectures for classifying retinal diseases from fundus images using the RFMiD (Retinal Fundus Multi-Disease Image Dataset). The research is based on the following articles:
 
+
+
+[**"ODIR-5k Dataset"**](https://odir2019.grand-challenge.org/dataset/)
+[**"Messidor-2 Dataset"**](https://www.kaggle.com/datasets/mariaherrerot/messidor2preprocess)
+
+
 [**"Research Article on Thyroid Nodule Classification"**](https://www.sciencedirect.com/science/article/pii/S1877050924031235)
 [**"Evaluating the Performance and Clinical Applications of Multiclass Deep Learning Models for Skin Cancer Pathology Diagnosis (ISIC): A Comparative Analysis of CNN, ViT, and VLM"**](https://dl.acm.org/doi/10.1145/3731763.3731793)
 [**"Retinal Fundus Multi-Disease Image Dataset (RFMiD): A Dataset for Multi-Disease Detection Research"**](https://ieee-dataport.org/open-access/retinal-fundus-multi-disease-image-dataset-rfmid)
