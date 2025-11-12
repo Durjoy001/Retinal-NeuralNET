@@ -104,47 +104,120 @@ class ODIRAnyAbnDataset(Dataset):
     def __getitem__(self, idx):
         s = self.samples[idx]
         try:
-            img = Image.open(s["img_path"]).convert("RGB")
-            if self.transform: img = self.transform(img)
-            return img, int(s["label"])
+        img = Image.open(s["img_path"]).convert("RGB")
+            if self.transform:
+                img = self.transform(img)
+        return img, int(s["label"])
         except Exception as e:
             raise RuntimeError(f"Failed to load image {s['img_path']}: {e}")
 
 # ----------------------
 # RFMiD to ODIR label mapping
 # ----------------------
+def find_label_indices(rfmid_labels: List[str], target_names: List[str], odir_class: str) -> List[int]:
+    """
+    Find indices of RFMiD labels matching target names.
+    First tries exact match, then fuzzy substring matching.
+    Returns list of indices and reports which labels were found/not found.
+    """
+    found_indices = []
+    found_names = []
+    not_found = []
+    
+    # Build lowercase lookup for fuzzy matching
+    label_lower_map = {name.lower(): (i, name) for i, name in enumerate(rfmid_labels)}
+    
+    for target in target_names:
+        target_lower = target.lower()
+        # Try exact match first
+        if target in rfmid_labels:
+            idx = rfmid_labels.index(target)
+            found_indices.append(idx)
+            found_names.append(target)
+        # Try fuzzy substring match
+        else:
+            matched = False
+            for label_lower, (idx, label_orig) in label_lower_map.items():
+                if target_lower in label_lower or label_lower in target_lower:
+                    if idx not in found_indices:  # Avoid duplicates
+                        found_indices.append(idx)
+                        found_names.append(label_orig)
+                        matched = True
+                        break
+            if not matched:
+                not_found.append(target)
+    
+    if not_found:
+        print(f"    ⚠️ {odir_class}: Could not find RFMiD labels: {not_found}")
+    if found_names:
+        print(f"    ✅ {odir_class}: Found {len(found_names)} labels -> {found_names}")
+    
+    return found_indices
+
 def build_odir_mapping(rfmid_labels: List[str]) -> Dict[str, List[int]]:
     """
     Return indices of RFMiD labels that correspond to each ODIR class:
     ODIR: D (DR), G (Glaucoma), C (Cataract), A (AMD),
           H (Hypertension), M (Myopia), O (Other)
     
-    Concrete mapping based on RFMiD label names:
-    D (DR): DR
-    G (Glaucoma): ODC (optic disc cupping)
-    C (Cataract): none present in RFMiD (intentionally empty)
-    A (AMD): ARMD, RPEC (RPE changes; often AMD-related)
-    H (Hypertension): AH (arterial hypertension), TV (tortuous vessels), ODE (optic disc edema)
-    M (Myopia): MYA (myopia), TSLN (tessellated fundus), ST (staphyloma)
-    O (Other): everything else that isn't in the sets above
+    Uses robust matching: exact match first, then fuzzy substring fallback.
+    Reports which labels were found/not found for transparency.
     """
-    # Build index lookup for all RFMiD labels
-    idx = {name: rfmid_labels.index(name) for name in rfmid_labels}
+    print(f"  Building RFMiD→ODIR mapping from {len(rfmid_labels)} RFMiD labels...")
     
-    mapping = {
-        "D": [idx["DR"]],
-        "G": [idx["ODC"]],
-        "C": [],  # no Cataract label in RFMiD (intentionally empty)
-        "A": [idx["ARMD"], idx["RPEC"]],
-        "H": [idx["AH"], idx["TV"], idx["ODE"]],
-        "M": [idx["MYA"], idx["TSLN"], idx["ST"]],
+    # Define target labels for each ODIR class (with fuzzy fallback candidates)
+    mapping_spec = {
+        "D": ["DR"],  # Diabetic Retinopathy
+        "G": ["ODC"],  # Optic Disc Cupping (Glaucoma)
+        "C": [],  # Cataract (intentionally empty - not in RFMiD)
+        "A": ["ARMD", "RPEC"],  # AMD: Age-related Macular Degeneration, RPE Changes
+        "H": ["AH", "TV", "ODE"],  # Hypertension: Arterial Hypertension, Tortuous Vessels, Optic Disc Edema
+        "M": ["MYA", "TSLN", "ST"],  # Myopia: Myopia, Tessellated Fundus, Staphyloma
     }
     
-    # O (Other): all remaining labels except ID and Disease_Risk
+    mapping = {}
+    for odir_class, target_names in mapping_spec.items():
+        if odir_class == "C":
+            mapping["C"] = []  # Intentionally empty
+            print(f"    ℹ️  C: Intentionally empty (no Cataract label in RFMiD)")
+        else:
+            indices = find_label_indices(rfmid_labels, target_names, odir_class)
+            mapping[odir_class] = indices
+    
+    # O (Other): Curated set of non-overlapping "other" diseases
+    # Only include frequent, distinct entities that don't overlap with D/G/A/H/M
     used = set(sum(mapping.values(), []))
-    others = [i for i, name in enumerate(rfmid_labels) 
-              if name not in ("ID", "Disease_Risk") and i not in used]
-    mapping["O"] = others
+    
+    # Curated "Other" labels - only include actual disease entities
+    # Exclude: ID, Disease_Risk, and labels already mapped to D/G/A/H/M
+    other_candidates = [
+        "BRVO", "CRVO",  # Retinal vein occlusions
+        "ERM",  # Epiretinal membrane
+        "MH", "MHL",  # Macular hole
+        "CSR",  # Central serous retinopathy
+        "LS", "MS",  # Laser scars, macular scars
+        "DN",  # Drusen (if not already in AMD)
+        "ODP",  # Optic disc pallor
+        "AION",  # Anterior ischemic optic neuropathy
+        "PT", "RT", "RS", "CRS",  # Pathological changes
+        "EDN",  # Edema
+        "RP",  # Retinal pigment changes
+        "OTHER",  # Explicit "other" category
+    ]
+    
+    # Find indices for curated "Other" labels
+    other_indices = find_label_indices(rfmid_labels, other_candidates, "O")
+    
+    # If we found curated labels, use them; otherwise fall back to all remaining
+    if other_indices:
+        mapping["O"] = other_indices
+        print(f"    ✅ O: {len(other_indices)} curated labels -> Other")
+    else:
+        # Fallback: use all remaining (but warn)
+        others = [i for i, name in enumerate(rfmid_labels) 
+                  if name not in ("ID", "Disease_Risk") and i not in used]
+        mapping["O"] = others
+        print(f"    ⚠️ O: No curated labels found, using {len(others)} remaining labels -> Other")
     
     return mapping
 
@@ -264,7 +337,7 @@ def eval_patient_level(samples, y_eye, s_eye, target_spec=0.80):
 # ----------------------
 def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_path, rfmid_labels,
                        odir_df, img_dir, device, batch_size=16,
-                       pooling="auto", logitsum_T=1.0,
+                       pooling="auto", logitsum_T=1.0, odir_final_pooling="noisyor",
                        use_rfmid_thresholds=False, drisk_idx=None,
                        recalibrate_frac=0.0, seed=42):
 
@@ -282,22 +355,19 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
     if recalibrate_frac and recalibrate_frac > 0.0:
         print(f"  Splitting data: {recalibrate_frac*100:.0f}% for calibration, {(1-recalibrate_frac)*100:.0f}% for testing...")
         indices = np.arange(len(full_ds))
-        # Try patient-level splitting to prevent data leakage
         patient_ids = [full_ds.samples[i]["pid"] for i in indices]
         if all(pid is not None for pid in patient_ids):
-            # Use patient-level grouping
             print(f"  Using patient-level splitting (prevents data leakage)")
             gss = GroupShuffleSplit(n_splits=1, test_size=1-recalibrate_frac, random_state=seed)
             calib_idx, test_idx = next(gss.split(indices, groups=patient_ids))
-            calib_idx = indices[calib_idx]
-            test_idx = indices[test_idx]
             calib_patients = len(set(patient_ids[i] for i in calib_idx))
             test_patients = len(set(patient_ids[i] for i in test_idx))
             print(f"  Split: {len(calib_idx)} images ({calib_patients} patients) calibration, {len(test_idx)} images ({test_patients} patients) test")
         else:
-            # Fallback to regular split if patient IDs not available
             print(f"  Using regular split (patient IDs not available)")
-            calib_idx, test_idx = train_test_split(indices, test_size=1-recalibrate_frac, random_state=seed, shuffle=True, stratify=None)
+            calib_idx, test_idx = train_test_split(
+                indices, test_size=1-recalibrate_frac, random_state=seed, shuffle=True, stratify=None
+            )
             print(f"  Split: {len(calib_idx)} images calibration, {len(test_idx)} images test")
     else:
         calib_idx, test_idx = None, np.arange(len(full_ds))
@@ -324,10 +394,45 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
     # Handle both "model_state_dict" and raw state dict formats
     state_dict = state.get("model_state_dict", state)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    # Compatibility check: Verify classifier weights were loaded
+    # Check for custom MLP classifier (classifier.0 = Dropout, classifier.1 = Linear, classifier.2 = ReLU, classifier.3 = Dropout, classifier.4 = Linear)
+    loaded_any_classifier = any(k.startswith("classifier.") for k in state_dict.keys())
+    # Check for TIMM's built-in head (head.* or fc.*, but not our custom classifier.*)
+    has_timm_head = any(k.startswith("head.") or k.startswith("fc.") for k in state_dict.keys())
+    
     if missing_keys:
-        print(f"  ⚠️ Missing keys in checkpoint: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"  ⚠️ Missing keys: {missing_keys}")
+        missing_classifier = [k for k in missing_keys if k.startswith("classifier.")]
+        if missing_classifier:
+            print(f"  ❌ CRITICAL: Missing classifier weights in checkpoint!")
+            print(f"     Missing classifier keys: {missing_classifier[:5]}..." if len(missing_classifier) > 5 else f"     Missing classifier keys: {missing_classifier}")
+            print(f"     This means the classifier head will be RANDOMLY INITIALIZED, causing poor performance!")
+            print(f"     Checkpoint likely used TIMM's built-in head, not the custom MLP head.")
+        else:
+            print(f"  ⚠️ Missing keys in checkpoint: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"  ⚠️ Missing keys: {missing_keys}")
+    
     if unexpected_keys:
-        print(f"  ⚠️ Unexpected keys in checkpoint: {unexpected_keys[:5]}..." if len(unexpected_keys) > 5 else f"  ⚠️ Unexpected keys: {unexpected_keys}")
+        unexpected_timm_head = [k for k in unexpected_keys if k.startswith("head.") or k.startswith("fc.")]
+        if unexpected_timm_head:
+            print(f"  ⚠️ WARNING: Checkpoint contains TIMM built-in head keys (head.* or fc.*)")
+            print(f"     Unexpected TIMM head keys: {unexpected_timm_head[:5]}..." if len(unexpected_timm_head) > 5 else f"     Unexpected TIMM head keys: {unexpected_timm_head}")
+            print(f"     This suggests the checkpoint was saved with TIMM's built-in head, not the custom MLP.")
+        else:
+            print(f"  ⚠️ Unexpected keys in checkpoint: {unexpected_keys[:5]}..." if len(unexpected_keys) > 5 else f"  ⚠️ Unexpected keys: {unexpected_keys}")
+    
+    # Final compatibility assertion
+    if not loaded_any_classifier:
+        print(f"  ❌ CRITICAL: No classifier.* weights found in checkpoint!")
+        print(f"     Classifier weights present in checkpoint: {loaded_any_classifier}")
+        print(f"     This means the checkpoint was saved with a different architecture (likely TIMM's built-in head).")
+        print(f"     The classifier will be randomly initialized, leading to poor performance.")
+        print(f"     Solution: Either retrain with the custom MLP head, or rebuild the eval model to match training.")
+    else:
+        print(f"  ✅ Classifier weights present in checkpoint: {loaded_any_classifier}")
+        if has_timm_head:
+            print(f"  ⚠️ WARNING: Checkpoint contains both custom classifier.* and TIMM head.*/fc.* keys.")
+            print(f"     This is unusual. The custom classifier will be used, but verify checkpoint compatibility.")
+    
     model.eval()
     print(f"  ✅ Model loaded and set to eval mode")
 
@@ -353,24 +458,28 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
     
     # Build ODIR mapping if using odir_map pooling
     odir_mapping = None
+    odir_active_classes = None  # Classes to use in Any-Abn pool (excludes empty ones)
     if pooling_mode == "odir_map":
         odir_mapping = build_odir_mapping(rfmid_labels)
-        # Fail fast if any ODIR class (except "C" which is intentionally empty) has no matching RFMiD classes
-        missing = [k for k, v in odir_mapping.items() if len(v) == 0 and k != "C"]
-        if missing:
-            raise ValueError(
-                f"RFMiD→ODIR mapping has empty classes: {missing}. "
-                f"Check build_odir_mapping() against your RFMiD column names. "
-                f"Available RFMiD labels: {rfmid_labels[:10]}..."
-            )
+        # Identify empty classes (except "C" which is intentionally empty)
+        empty_classes = [k for k, v in odir_mapping.items() if len(v) == 0 and k != "C"]
+        if empty_classes:
+            print(f"  ⚠️ Warning: Empty ODIR classes found: {empty_classes}. These will be dropped from Any-Abn pool.")
+            # Drop empty classes from the Any-Abn computation
+            odir_active_classes = [k for k in ["D", "G", "C", "A", "H", "M", "O"] 
+                                   if k not in empty_classes or k == "C"]
+            print(f"  ✅ Using {len(odir_active_classes)} ODIR classes for Any-Abn: {odir_active_classes}")
+        else:
+            odir_active_classes = ["D", "G", "C", "A", "H", "M", "O"]  # All classes
         total_mapped = sum(len(v) for v in odir_mapping.values())
-        print(f"  ✅ Built RFMiD→ODIR mapping ({total_mapped} RFMiD classes mapped):")
-        for k, v in odir_mapping.items():
-            if v:
-                mapped_names = [rfmid_labels[i] for i in v[:3]]  # Show first 3
-                print(f"    {k}: {len(v)} RFMiD classes -> {mapped_names}{'...' if len(v) > 3 else ''}")
-            elif k == "C":
-                print(f"    {k}: 0 RFMiD classes (intentionally empty - no Cataract label in RFMiD)")
+        print(f"  ✅ Built RFMiD→ODIR mapping ({total_mapped} RFMiD classes mapped)")
+        print(f"  Final Any-Abn pooling: {odir_final_pooling}" + (f" (T={logitsum_T})" if odir_final_pooling == "logitsum" else ""))
+        
+        # Warn if using odir_map without recalibration (RFMiD thresholds don't apply)
+        if recalibrate_frac == 0.0:
+            print(f"  ⚠️ Warning: Using odir_map without recalibration (--recalibrate_frac=0).")
+            print(f"     RFMiD thresholds don't apply to odir_map pooling. External ODIR is uncalibrated.")
+            print(f"     Recommendation: Use --recalibrate_frac 0.2 for temperature scaling + threshold calibration.")
 
     # Optional RFMiD threshold (Disease_Risk only)
     rfmid_thr = None
@@ -407,16 +516,23 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
                 if pooling_mode == "drisk":
                     pooled = probs[:, drisk_idx]
                 elif pooling_mode == "odir_map":
-                    # Map RFMiD -> ODIR classes, then Any-Abn across 7
-                    p_D = noisyor_over_indices(probs, odir_mapping["D"])
-                    p_G = noisyor_over_indices(probs, odir_mapping["G"])
-                    p_C = noisyor_over_indices(probs, odir_mapping["C"])
-                    p_A = noisyor_over_indices(probs, odir_mapping["A"])
-                    p_H = noisyor_over_indices(probs, odir_mapping["H"])
-                    p_M = noisyor_over_indices(probs, odir_mapping["M"])
-                    p_O = noisyor_over_indices(probs, odir_mapping["O"])
-                    odir_vec = np.stack([p_D, p_G, p_C, p_A, p_H, p_M, p_O], axis=1)  # [B,7]
-                    pooled = 1.0 - np.prod(1.0 - np.clip(odir_vec, 1e-6, 1-1e-6), axis=1)  # Any-Abn across 7
+                    # Map RFMiD -> ODIR classes, then Any-Abn across active classes only
+                    odir_probs = {}
+                    for cls in ["D", "G", "C", "A", "H", "M", "O"]:
+                        odir_probs[cls] = noisyor_over_indices(probs, odir_mapping[cls])
+                    # Stack only active classes (drop empty ones except C)
+                    odir_vec_list = [odir_probs[cls] for cls in odir_active_classes]
+                    if odir_vec_list:
+                        odir_vec = np.stack(odir_vec_list, axis=1)  # [B, num_active]
+                        # Use specified final pooling method (noisyor or logitsum)
+                        if odir_final_pooling == "logitsum":
+                            pooled = pool_any(odir_vec, mode="logitsum", T=logitsum_T)
+                        else:  # default: noisyor
+                            pooled = 1.0 - np.prod(1.0 - np.clip(odir_vec, 1e-6, 1-1e-6), axis=1)
+                    else:
+                        # Fallback: if all classes are empty, use noisyor over all RFMiD classes
+                        print("  ⚠️ All ODIR classes empty, falling back to noisyor over all RFMiD classes")
+                        pooled = pool_any(probs, mode="noisyor")
                 elif pooling_mode == "noisyor":
                     pooled = pool_any(probs, mode="noisyor")
                 elif pooling_mode == "max":
@@ -457,15 +573,21 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
         elif pooling_mode == "odir_map":
             # Compute pooled prob from unscaled logits, then convert to logit
             probs_c = 1.0 / (1.0 + np.exp(-logits_c))  # sigmoid
-            p_D = noisyor_over_indices(probs_c, odir_mapping["D"])
-            p_G = noisyor_over_indices(probs_c, odir_mapping["G"])
-            p_C = noisyor_over_indices(probs_c, odir_mapping["C"])
-            p_A = noisyor_over_indices(probs_c, odir_mapping["A"])
-            p_H = noisyor_over_indices(probs_c, odir_mapping["H"])
-            p_M = noisyor_over_indices(probs_c, odir_mapping["M"])
-            p_O = noisyor_over_indices(probs_c, odir_mapping["O"])
-            odir_vec = np.stack([p_D, p_G, p_C, p_A, p_H, p_M, p_O], axis=1)
-            pooled_prob = 1.0 - np.prod(1.0 - np.clip(odir_vec, 1e-6, 1-1e-6), axis=1)
+            odir_probs = {}
+            for cls in ["D", "G", "C", "A", "H", "M", "O"]:
+                odir_probs[cls] = noisyor_over_indices(probs_c, odir_mapping[cls])
+            # Stack only active classes (drop empty ones except C)
+            odir_vec_list = [odir_probs[cls] for cls in odir_active_classes]
+            if odir_vec_list:
+                odir_vec = np.stack(odir_vec_list, axis=1)
+                # Use specified final pooling method (noisyor or logitsum)
+                if odir_final_pooling == "logitsum":
+                    pooled_prob = pool_any(odir_vec, mode="logitsum", T=logitsum_T)
+                else:  # default: noisyor
+                    pooled_prob = 1.0 - np.prod(1.0 - np.clip(odir_vec, 1e-6, 1-1e-6), axis=1)
+            else:
+                # Fallback: if all classes are empty, use noisyor over all RFMiD classes
+                pooled_prob = pool_any(probs_c, mode="noisyor")
             # Convert pooled prob back to logit
             l_c_pooled = np.log(np.clip(pooled_prob, 1e-6, 1-1e-6) / np.clip(1 - pooled_prob, 1e-6, 1-1e-6))
         elif pooling_mode == "noisyor":
@@ -550,7 +672,7 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
             "F1max_Recall": float(rec_f1),
         }
         print(f"  ✅ AUC: {auc:.4f}, F1max: {f1max:.4f} at threshold {thr_f1:.6f}")
-    
+
     def eval_at_thr(name, thr):
         y_pred = (s_t >= thr).astype(int)
         tn, fp, fn, tp = confusion_matrix(y_t, y_pred, labels=[0,1]).ravel()
@@ -577,12 +699,10 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
     # Threshold-based metrics only computed if not single class
     if not single_class:
         print(f"\n  Computing metrics at different thresholds...")
-        # 1) Spec-80 threshold computed on the SAME ODIR test (for a pure AUC/curve summary)
-        thr80, spec80, sens80 = pick_thr_for_specificity(y_t, s_t, target_spec=0.80)
-        results.update(eval_at_thr("Spec80_onTest", thr80))
+    thr80, spec80, sens80 = pick_thr_for_specificity(y_t, s_t, target_spec=0.80)
+    results.update(eval_at_thr("Spec80_onTest", thr80))
         print(f"    Spec80_onTest: threshold={thr80:.6f}, sens={sens80:.3f}, spec={spec80:.3f}")
 
-        # 2) RFMiD Disease_Risk threshold (if provided and using Disease_Risk pooling)
         if rfmid_thr is not None and pooling_mode == "drisk":
             rfmid_metrics = eval_at_thr("RFMiD_thr", rfmid_thr)
             results.update(rfmid_metrics)
@@ -591,8 +711,7 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
         elif rfmid_thr is not None:
             print(f"    ⚠️ Skipping RFMiD_thr metrics because pooling_mode != 'drisk' (threshold not comparable).")
 
-        # 3) ODIR recalibrated threshold (if used)
-        if calib_thr is not None:
+    if calib_thr is not None:
             calib_metrics = eval_at_thr("ODIR_calib_thr", calib_thr)
             results.update(calib_metrics)
             print(f"    ODIR_calib_thr: threshold={calib_thr:.6f}, sens={calib_metrics['ODIR_calib_thr_Sensitivity']:.3f}, "
@@ -657,6 +776,7 @@ def main(args):
             batch_size=args.batch_size,
             pooling=("auto" if args.pooling == "auto" else args.pooling),
             logitsum_T=args.logitsum_T,
+            odir_final_pooling=args.odir_final_pooling,
             use_rfmid_thresholds=args.use_rfmid_thresholds,
             recalibrate_frac=args.recalibrate_frac,
             seed=args.seed
@@ -693,7 +813,7 @@ def main(args):
         if 'ODIR_calib_thr_Sensitivity' in metrics:
             print(f"  @ODIR-calib thr: sens={metrics['ODIR_calib_thr_Sensitivity']:.4f} spec={metrics['ODIR_calib_thr_Specificity']:.4f}")
         if 'Spec80_onTest_Sensitivity' in metrics:
-            print(f"  @Spec≈0.80 on test: sens={metrics['Spec80_onTest_Sensitivity']:.4f} thr={metrics['Spec80_onTest_Threshold']:.4f}")
+        print(f"  @Spec≈0.80 on test: sens={metrics['Spec80_onTest_Sensitivity']:.4f} thr={metrics['Spec80_onTest_Threshold']:.4f}")
         else:
             print("  @Spec≈0.80 on test: n/a (single-class test split)")
 
@@ -715,10 +835,13 @@ if __name__ == "__main__":
     p.add_argument("--pooling", choices=["auto","noisyor","max","logitsum","drisk","odir_map"], default="auto",
                    help="auto: Disease_Risk if present else Noisy-OR; 'odir_map' maps RFMiD classes into ODIR classes before Any-Abn.")
     p.add_argument("--logitsum_T", type=float, default=1.0, help="Temperature for logitsum pooling.")
+    p.add_argument("--odir_final_pooling", choices=["noisyor", "logitsum"], default="noisyor",
+                   help="Final pooling method for odir_map mode: 'noisyor' (default) or 'logitsum' (less sensitive to long tails, use with --logitsum_T > 1).")
     p.add_argument("--use_rfmid_thresholds", action="store_true",
                    help="If set, apply RFMiD per-class threshold for Disease_Risk from optimal_thresholds.npy.")
-    p.add_argument("--recalibrate_frac", type=float, default=0.0,
-                   help="Fraction of ODIR used ONLY to calibrate a spec≈0.80 threshold (no training). 0 disables.")
+    p.add_argument("--recalibrate_frac", type=float, default=0.2,
+                   help="Fraction of ODIR used ONLY to calibrate temperature scaling + spec≈0.80 threshold (no training). "
+                        "Default 0.2. Set to 0.0 to disable. RECOMMENDED for odir_map pooling to lift sensitivity.")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
     main(args)
