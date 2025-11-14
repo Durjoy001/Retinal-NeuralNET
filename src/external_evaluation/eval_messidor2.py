@@ -95,6 +95,32 @@ class CLAHETransform:
             # Simple fallback if cv2 is not present
             return ImageOps.equalize(img)
 
+class BackgroundSubtraction(object):
+    """
+    Approximate background subtraction (Hemelings-style):
+    - Blur image with Gaussian filter to get background
+    - Subtract background, rescale to [0, 255]
+    """
+    def __init__(self, kernel_size=31):
+        self.blur = transforms.GaussianBlur(kernel_size=kernel_size)
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if not isinstance(img, Image.Image):
+            raise TypeError("BackgroundSubtraction expects a PIL Image")
+
+        blurred = self.blur(img)
+
+        img_np = np.asarray(img).astype(np.float32)
+        bg_np = np.asarray(blurred).astype(np.float32)
+
+        sub = img_np - bg_np
+        sub = sub - sub.min()
+        max_val = sub.max()
+        if max_val > 0:
+            sub = sub / max_val * 255.0
+        sub = np.clip(sub, 0, 255).astype(np.uint8)
+        return Image.fromarray(sub)
+
 def build_eval_transform(img_size=448, use_clahe=True):
     """Build enhanced evaluation transform with square padding, optional CLAHE, and larger input."""
     transform_list = [
@@ -248,33 +274,49 @@ class CNNAdapter(ModelAdapter):
         self.model_name = model_name.lower()
 
     def build(self) -> nn.Module:
+        """
+        Build CNN model exactly as train_cnn_final.py does.
+        For binary-only models (num_classes=1), architecture matches training exactly.
+        """
         if self.model_name == "densenet121":
             model = models.densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
             in_f = model.classifier.in_features
             model.classifier = nn.Sequential(
-                nn.Dropout(0.5), nn.Linear(in_f, 256), nn.ReLU(),
-                nn.Dropout(0.3), nn.Linear(256, self.num_classes)
+                nn.Dropout(0.5),
+                nn.Linear(in_f, 256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, self.num_classes)
             )
         elif self.model_name == "resnet50":
             model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
             in_f = model.fc.in_features
             model.fc = nn.Sequential(
-                nn.Dropout(0.5), nn.Linear(in_f, 256), nn.ReLU(),
-                nn.Dropout(0.3), nn.Linear(256, self.num_classes)
+                nn.Dropout(0.5),
+                nn.Linear(in_f, 256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, self.num_classes)
             )
         elif self.model_name == "efficientnet_b3":
             model = models.efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
             in_f = model.classifier[1].in_features
             model.classifier = nn.Sequential(
-                nn.Dropout(0.5), nn.Linear(in_f, 256), nn.ReLU(),
-                nn.Dropout(0.3), nn.Linear(256, self.num_classes)
+                nn.Dropout(0.5),
+                nn.Linear(in_f, 256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, self.num_classes)
             )
         elif self.model_name == "inception_v3":
             model = models.inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, aux_logits=False)
             in_f = model.fc.in_features
             model.fc = nn.Sequential(
-                nn.Dropout(0.5), nn.Linear(in_f, 256), nn.ReLU(),
-                nn.Dropout(0.3), nn.Linear(256, self.num_classes)
+                nn.Dropout(0.5),
+                nn.Linear(in_f, 256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, self.num_classes)
             )
         else:
             raise ValueError(f"Unknown CNN model: {self.model_name}")
@@ -284,13 +326,23 @@ class CNNAdapter(ModelAdapter):
         return model
 
     def transforms(self, is_train: bool):
-        W = {
-            "resnet50": ResNet50_Weights.IMAGENET1K_V1,
-            "efficientnet_b3": EfficientNet_B3_Weights.IMAGENET1K_V1,
-            "inception_v3": Inception_V3_Weights.IMAGENET1K_V1,
-            "densenet121": DenseNet121_Weights.IMAGENET1K_V1,
-        }[self.model_name]
-        return W.transforms(antialias=True)
+        """
+        Use Hemelings-style preprocessing to match train_cnn_final.py:
+        1) Center crop to 1016 x 1016
+        2) Resize to 224 x 224
+        3) Gaussian background subtraction
+        4) ToTensor + ImageNet normalization
+        """
+        return transforms.Compose([
+            transforms.CenterCrop(1016),
+            transforms.Resize((224, 224)),
+            BackgroundSubtraction(kernel_size=31),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
 
 class CLIPAdapter(ModelAdapter):
     """Adapter for CLIP models (requires open_clip)."""
@@ -611,7 +663,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_name", required=True, help="Model name from registry")
     ap.add_argument("--checkpoint", required=True, help="Path to RFMiD best-AUC checkpoint .pth")
-    ap.add_argument("--thresholds", required=True, help="Path to RFMiD per-class thresholds .npy")
+    ap.add_argument("--thresholds", required=False, default=None, help="Path to RFMiD per-class thresholds .npy (optional for binary-only CNN with threshold selection)")
     ap.add_argument("--rfmid_train_csv", required=True, help="RFMiD training labels CSV (to recover label order)")
     ap.add_argument("--messidor_csv", required=True, help="Messidor-2 labels CSV")
     ap.add_argument("--images_dir", required=True, help="Messidor-2 images directory")
@@ -625,7 +677,8 @@ def main():
                     help="Method for threshold selection on validation split: 'youden' (max J, default), 'f1max' (max F1), 'sensitivity' (target TPR), 'specificity' (target TNR)")
     ap.add_argument("--val_split", type=float, default=0.2, help="Fraction of Messidor-2 data to use for validation (for threshold selection). Default: 0.2")
     ap.add_argument("--eval_img_size", type=int, default=448, help="Input image size for evaluation (default: 448, larger than training)")
-    ap.add_argument("--use_tta", action="store_true", default=True, help="Use test-time augmentation (average original + horizontal flip). Default: True")
+    ap.add_argument("--use_tta", action="store_true", default=False, help="Use test-time augmentation (average original + horizontal flip). Default: False")
+    ap.add_argument("--no_tta", action="store_false", dest="use_tta", help="Disable test-time augmentation (faster evaluation)")
     ap.add_argument("--tta_num_augments", type=int, default=5, help="Number of TTA augmentations (default: 5, includes flip, rotations, scales)")
     ap.add_argument("--disable_clahe", action="store_true", help="Disable CLAHE preprocessing (use standard transforms)")
     ap.add_argument("--use_temperature_scaling", action="store_true", help="Apply temperature scaling calibration on validation split")
@@ -652,41 +705,82 @@ def main():
     # Load RFMiD schema and thresholds
     rfmid_train = pd.read_csv(args.rfmid_train_csv)
     label_columns = [c for c in rfmid_train.columns if c != "ID"]
-    thresholds = np.load(args.thresholds)
+    
+    # Load thresholds (optional for binary-only CNN with threshold selection)
+    if args.thresholds is None or not Path(args.thresholds).exists():
+        if args.target_specificity is not None or args.target_sensitivity is not None or args.threshold_method in ["youden", "f1max"]:
+            # Threshold selection will be used, so we can create a dummy threshold array
+            print(f"⚠️  Threshold file not provided or doesn't exist: {args.thresholds}")
+            print(f"   Using threshold selection on Messidor-2 validation split instead")
+            thresholds = np.array([0.5])  # Dummy threshold, will be replaced by threshold selection
+        else:
+            raise ValueError(f"Threshold file required: {args.thresholds}. Provide --thresholds or use threshold selection (--target_specificity, --target_sensitivity, or --threshold_method)")
+    else:
+        thresholds = np.load(args.thresholds)
+
     
     # Check if checkpoint has binary head (affects expected threshold count)
     ckpt_preview = torch.load(args.checkpoint, map_location="cpu")
     state_preview = ckpt_preview.get("model_state_dict", ckpt_preview)
     has_binary_head_in_ckpt = any(k.startswith("binary_classifier.") for k in state_preview.keys())
     
-    # Thresholds file should have one threshold per disease class (excludes Disease_Risk if binary head exists)
-    expected_threshold_count = len(label_columns) - (1 if ("Disease_Risk" in label_columns and has_binary_head_in_ckpt) else 0)
+    # Check if it's a binary-only CNN model (pure binary, not multi-label + binary)
+    # Binary-only models have last layer with 1 output (e.g., fc.4.weight with shape [1, 256])
+    is_binary_only_cnn = False
+    if args.model_name.lower() in ["densenet121", "resnet50", "efficientnet_b3", "inception_v3"]:
+        # Check last classifier layer
+        for k in reversed(list(state_preview.keys())):
+            if "weight" in k and ("fc" in k or "classifier" in k):
+                weight_shape = state_preview[k].shape
+                if weight_shape[0] == 1:  # Binary output
+                    is_binary_only_cnn = True
+                    print(f"✅ Detected binary-only CNN model (last layer: {k}, shape: {weight_shape})")
+                break
     
-    if len(thresholds) != expected_threshold_count:
-        raise ValueError(f"Threshold length mismatch: expected {expected_threshold_count} thresholds (for {len(label_columns)} label columns, "
-                        f"{'excluding Disease_Risk' if has_binary_head_in_ckpt and 'Disease_Risk' in label_columns else 'including all'}), "
-                        f"but got {len(thresholds)} thresholds in file.")
+    # Thresholds file handling:
+    # - Binary-only CNN: single threshold (optimal_threshold_spec80.npy)
+    # - Multi-label + binary head: thresholds for disease classes (excludes Disease_Risk)
+    # - Multi-label only: thresholds for all classes
+    if is_binary_only_cnn:
+        # Binary-only model: expect single threshold
+        if len(thresholds) != 1:
+            print(f"⚠️  Warning: Binary-only CNN model expects 1 threshold, but got {len(thresholds)}. Using first threshold.")
+            thresholds = np.array([thresholds[0] if len(thresholds) > 0 else 0.5])
+        expected_threshold_count = 1
+    else:
+        expected_threshold_count = len(label_columns) - (1 if ("Disease_Risk" in label_columns and has_binary_head_in_ckpt) else 0)
+        if len(thresholds) != expected_threshold_count:
+            raise ValueError(f"Threshold length mismatch: expected {expected_threshold_count} thresholds (for {len(label_columns)} label columns, "
+                            f"{'excluding Disease_Risk' if has_binary_head_in_ckpt and 'Disease_Risk' in label_columns else 'including all'}), "
+                            f"but got {len(thresholds)} thresholds in file.")
 
-    dr_idx = _find_label_index(label_columns, DR_ALIASES)
-    if dr_idx is None:
-        raise ValueError(f"Could not find DR column in RFMiD labels. Checked aliases: {DR_ALIASES}")
+    # For binary-only CNN, we don't need DR index (model outputs binary directly)
+    if is_binary_only_cnn:
+        dr_idx = None  # Not needed for binary-only model
+        dr_idx_in_multilabel = None
+        tau_dr = float(thresholds[0])  # Single threshold for binary model
+        print(f"✅ Binary-only CNN: Using single threshold {tau_dr:.6f} from optimal_threshold_spec80.npy")
+    else:
+        dr_idx = _find_label_index(label_columns, DR_ALIASES)
+        if dr_idx is None:
+            raise ValueError(f"Could not find DR column in RFMiD labels. Checked aliases: {DR_ALIASES}")
 
-    # Map dr_idx to thresholds array index and multilabel probabilities index
-    # If Disease_Risk is excluded from multilabel head (binary head model), adjust index
-    if "Disease_Risk" in label_columns and has_binary_head_in_ckpt:
-        # Find Disease_Risk index in label_columns
-        drisk_idx_in_labels = label_columns.index("Disease_Risk")
-        # If DR comes after Disease_Risk, subtract 1 from dr_idx
-        if dr_idx > drisk_idx_in_labels:
-            dr_idx_in_multilabel = dr_idx - 1
+        # Map dr_idx to thresholds array index and multilabel probabilities index
+        # If Disease_Risk is excluded from multilabel head (binary head model), adjust index
+        if "Disease_Risk" in label_columns and has_binary_head_in_ckpt:
+            # Find Disease_Risk index in label_columns
+            drisk_idx_in_labels = label_columns.index("Disease_Risk")
+            # If DR comes after Disease_Risk, subtract 1 from dr_idx
+            if dr_idx > drisk_idx_in_labels:
+                dr_idx_in_multilabel = dr_idx - 1
+            else:
+                dr_idx_in_multilabel = dr_idx
         else:
             dr_idx_in_multilabel = dr_idx
-    else:
-        dr_idx_in_multilabel = dr_idx
-    
-    # For thresholds, use the same mapping
-    dr_idx_in_thresholds = dr_idx_in_multilabel
-    tau_dr = float(thresholds[dr_idx_in_thresholds])
+        
+        # For thresholds, use the same mapping
+        dr_idx_in_thresholds = dr_idx_in_multilabel
+        tau_dr = float(thresholds[dr_idx_in_thresholds])
     # Default: use threshold_method (Youden's J) on validation split
     # All threshold adaptation methods will compute threshold on validation split to prevent test leakage
     if args.any_thr is not None:
@@ -770,8 +864,13 @@ def main():
     has_binary_head_in_ckpt = any(k.startswith("binary_classifier.") for k in state.keys())
     
     # Build model via adapter
-    # Exclude Disease_Risk from num_classes if it exists (for new model architecture)
-    if "Disease_Risk" in label_columns:
+    # For binary-only CNN: num_classes = 1 (binary output)
+    # For multi-label + binary head: exclude Disease_Risk from multilabel head
+    # For multi-label only: use all classes
+    if is_binary_only_cnn:
+        num_classes = 1  # Binary-only model
+        print(f"✅ Binary-only CNN model detected - building with num_classes=1")
+    elif "Disease_Risk" in label_columns:
         num_classes = len(label_columns) - 1  # Exclude Disease_Risk from multilabel head
         if has_binary_head_in_ckpt:
             print(f"✅ Binary Disease_Risk head detected in checkpoint - will use for Messidor-2 (DR-only dataset)")
@@ -860,11 +959,19 @@ def main():
             print(f"⚠️  Warning: ViT models require 224x224 input (trained size). Overriding eval_img_size from {eval_img_size} to 224.")
             eval_img_size = 224
     
-    # Use enhanced eval transform (larger input, optional CLAHE, square padding)
-    use_clahe = not args.disable_clahe
-    tfm = build_eval_transform(img_size=eval_img_size, use_clahe=use_clahe)
-    clahe_str = "with CLAHE" if use_clahe else "without CLAHE"
-    print(f"Using enhanced eval transform: {eval_img_size}x{eval_img_size} {clahe_str} and square padding")
+    # Use adapter's transforms for CNN models (Hemelings-style preprocessing to match training)
+    # For other models (ViT, Hybrid, VLM), use enhanced eval transform
+    if model_name_lower in ["densenet121", "resnet50", "efficientnet_b3", "inception_v3"]:
+        # CNN models: use Hemelings-style preprocessing (matches train_cnn_final.py)
+        tfm = adapter.transforms(is_train=False)
+        print(f"✅ Using Hemelings-style preprocessing for CNN model (matches training):")
+        print(f"   Center crop 1016 → Resize 224 → Background subtraction → Normalize")
+    else:
+        # ViT, Hybrid, VLM models: use enhanced eval transform
+        use_clahe = not args.disable_clahe
+        tfm = build_eval_transform(img_size=eval_img_size, use_clahe=use_clahe)
+        clahe_str = "with CLAHE" if use_clahe else "without CLAHE"
+        print(f"Using enhanced eval transform: {eval_img_size}x{eval_img_size} {clahe_str} and square padding")
     
     # Create datasets
     ds_test = Messidor2Dataset(Path(args.images_dir), mdf_test, tfm)
@@ -934,7 +1041,7 @@ def main():
     def run_inference(dataloader, dataset_name="test", temperature=1.0):
         """Run inference with optional TTA and temperature scaling."""
         all_logits = []
-        all_binary_logits = [] if has_binary_head_in_ckpt else None
+        all_binary_logits = [] if (has_binary_head_in_ckpt or is_binary_only_cnn) else None
         all_ids = []
         total_batches = len(dataloader)
         print(f"Running inference on {len(dataloader.dataset)} {dataset_name} images ({total_batches} batches)...")
@@ -951,21 +1058,29 @@ def main():
                 if args.use_tta:
                     tta_transforms = get_tta_transforms(xb)
                     logits_list = []
-                    binary_logits_list = [] if has_binary_head_in_ckpt else None
+                    binary_logits_list = [] if (has_binary_head_in_ckpt or is_binary_only_cnn) else None
                     for xb_aug in tta_transforms:
                         outputs = model(xb_aug)
-                        # Handle both single output (old model) and tuple output (new model with binary head)
-                        if isinstance(outputs, tuple):
+                        # Handle binary-only CNN (single output [B, 1])
+                        if is_binary_only_cnn:
+                            binary_logits = outputs  # Binary-only CNN outputs [B, 1] directly
+                            if binary_logits_list is not None:
+                                binary_logits_list.append(binary_logits)
+                            logits_list.append(binary_logits)  # For compatibility
+                        # Handle tuple output (multi-label + binary head)
+                        elif isinstance(outputs, tuple):
                             multilabel_logits, binary_logits = outputs
                             if binary_logits_list is not None:
                                 binary_logits_list.append(binary_logits)
+                            logits_list.append(multilabel_logits)
+                        # Handle single output (multi-label only)
                         else:
                             multilabel_logits = outputs
                             if hasattr(multilabel_logits, "logits"):
                                 multilabel_logits = multilabel_logits.logits
                             elif isinstance(multilabel_logits, (tuple, list)):
                                 multilabel_logits = multilabel_logits[0]
-                        logits_list.append(multilabel_logits)
+                            logits_list.append(multilabel_logits)
                     logits_avg = torch.stack(logits_list).mean(dim=0)
                     if binary_logits_list is not None:
                         binary_logits_avg = torch.stack(binary_logits_list).mean(dim=0)
@@ -973,9 +1088,14 @@ def main():
                         binary_logits_avg = None
                 else:
                     outputs = model(xb)
-                    # Handle both single output (old model) and tuple output (new model with binary head)
-                    if isinstance(outputs, tuple):
+                    # Handle binary-only CNN (single output [B, 1])
+                    if is_binary_only_cnn:
+                        logits_avg = outputs  # Binary-only CNN outputs [B, 1] directly
+                        binary_logits_avg = outputs
+                    # Handle tuple output (multi-label + binary head)
+                    elif isinstance(outputs, tuple):
                         logits_avg, binary_logits_avg = outputs
+                    # Handle single output (multi-label only)
                     else:
                         logits_avg = outputs
                         binary_logits_avg = None
@@ -1001,8 +1121,13 @@ def main():
         all_logits = torch.cat(all_logits, dim=0)
         all_probs = torch.sigmoid(all_logits).numpy()
         
-        # If binary head available, use it for Messidor-2 (DR-only, so binary head = any abnormal = DR present)
-        if has_binary_head_in_ckpt and all_binary_logits is not None:
+        # If binary-only CNN or binary head available, use it for Messidor-2 (DR-only, so binary = any abnormal = DR present)
+        if is_binary_only_cnn:
+            # Binary-only CNN: output is already binary [N, 1]
+            binary_probs = all_probs.squeeze()  # [N, 1] -> [N]
+            print(f"✅ Inference complete: {len(binary_probs)} images, using binary-only CNN output for Messidor-2 (DR-only dataset).")
+            return all_probs, all_ids, binary_probs
+        elif has_binary_head_in_ckpt and all_binary_logits is not None:
             all_binary_logits = torch.cat(all_binary_logits, dim=0)
             binary_probs = torch.sigmoid(all_binary_logits).numpy().squeeze()
             print(f"✅ Inference complete: {all_probs.shape[0]} images, using binary Disease_Risk head for Messidor-2 (DR-only dataset).")
@@ -1037,18 +1162,25 @@ def main():
         
         print(f"  Running inference on {len(dl_train_for_temp.dataset)} images ({total_batches} batches)...")
         all_logits_train_raw = []
-        all_binary_logits_train_raw = [] if has_binary_head_in_ckpt else None
+        all_binary_logits_train_raw = [] if (has_binary_head_in_ckpt or is_binary_only_cnn) else None
         with torch.inference_mode(), torch.autocast(device_type=dev_type, enabled=(dev_type != "cpu")):
             for batch_idx, (xb, _) in enumerate(dl_train_for_temp, 1):
                 xb = xb.to(device)
                 # Skip TTA for temperature scaling - just need raw logits for calibration
                 outputs = model(xb)
-                # Handle both single output (old model) and tuple output (new model with binary head)
-                if isinstance(outputs, tuple):
+                # Handle binary-only CNN (single output [B, 1])
+                if is_binary_only_cnn:
+                    binary_logits = outputs  # Binary-only CNN outputs [B, 1] directly
+                    if all_binary_logits_train_raw is not None:
+                        all_binary_logits_train_raw.append(binary_logits.cpu())
+                    all_logits_train_raw.append(binary_logits.cpu())
+                # Handle tuple output (multi-label + binary head)
+                elif isinstance(outputs, tuple):
                     multilabel_logits, binary_logits = outputs
                     if all_binary_logits_train_raw is not None:
                         all_binary_logits_train_raw.append(binary_logits.cpu())
                     all_logits_train_raw.append(multilabel_logits.cpu())
+                # Handle single output (multi-label only)
                 else:
                     logits = outputs
                     if hasattr(logits, "logits"):
@@ -1068,8 +1200,17 @@ def main():
         else:
             y_dr_train = (mdf_train["diagnosis"].astype(int) > 0).astype(np.int32).values
         
-        # Use binary head logits if available (better calibrated for any abnormal = DR)
-        if args.use_dr_head:
+        # Use binary logits if available (better calibrated for any abnormal = DR)
+        if is_binary_only_cnn:
+            # Binary-only CNN: use the binary logits directly
+            if all_binary_logits_train_raw is not None:
+                all_binary_logits_train_raw = torch.cat(all_binary_logits_train_raw, dim=0)
+                dr_logits_train = all_binary_logits_train_raw.squeeze()  # [N, 1] -> [N]
+            else:
+                # Fallback: use all_logits_train_raw (which is already binary for binary-only CNN)
+                dr_logits_train = all_logits_train_raw.squeeze()  # [N, 1] -> [N]
+            print(f"  Using binary-only CNN logits for temperature scaling")
+        elif args.use_dr_head:
             # Force use of DR head logits
             dr_logits_train = all_logits_train_raw[:, dr_idx_in_multilabel]  # Keep as tensor
             print(f"  Using DR head logits for temperature scaling (user-specified)")
@@ -1111,7 +1252,10 @@ def main():
     # CRITICAL: Always compute thresholds on validation split to prevent test leakage
     if use_val_split:
         all_probs_train, all_ids_train, binary_probs_train = run_inference(dl_train, "train (for threshold selection)", temperature=temperature)
-        if args.use_dr_head:
+        if is_binary_only_cnn:
+            # Binary-only CNN: use binary probabilities directly
+            dr_scores_train = binary_probs_train if binary_probs_train is not None else all_probs_train.squeeze()
+        elif args.use_dr_head:
             # Force use of DR head
             dr_scores_train = all_probs_train[:, dr_idx_in_multilabel]
         elif has_binary_head_in_ckpt and binary_probs_train is not None:
@@ -1122,10 +1266,24 @@ def main():
         y_dr_train = (mdf_train["diagnosis"].astype(int) > 0).astype(np.int32).values
 
     # Scores for endpoints (DR-only for Messidor-2)
-    # Option 1: Binary head (recommended) - trained for "any abnormal vs normal"
-    # Option 2: DR head from multilabel - trained specifically for DR
-    # Default: use binary head if available (better calibrated for binary classification)
-    if args.use_dr_head:
+    # For binary-only CNN models (trained with train_cnn_final.py):
+    #   - Model architecture matches train_cnn_final.py exactly (Dropout(0.5) -> Linear(256) -> ReLU -> Dropout(0.3) -> Linear(1))
+    #   - Model was trained for "any abnormal vs normal" binary classification task
+    #   - Output is directly used for "any abnormal" evaluation (diagnosis > 0)
+    # Option 1: Binary-only CNN (direct binary output) - matches train_cnn_final.py
+    # Option 2: Binary head (recommended) - trained for "any abnormal vs normal"
+    # Option 3: DR head from multilabel - trained specifically for DR
+    # Default: use binary output if available (better calibrated for binary classification)
+    if is_binary_only_cnn:
+        # Binary-only CNN: use binary probabilities directly for "any abnormal" evaluation
+        # This matches train_cnn_final.py: model trained for diseases_risk (any disease present = 1, normal = 0)
+        dr_scores = binary_probs if binary_probs is not None else all_probs.squeeze()
+        any_scores = dr_scores  # For binary-only CNN, "any abnormal" = binary output
+        print(f"  ✅ Using binary-only CNN output for 'any abnormal' evaluation (matches train_cnn_final.py)")
+        print(f"     Model architecture: ResNet50 with binary head (Dropout(0.5) -> Linear(256) -> ReLU -> Dropout(0.3) -> Linear(1))")
+        print(f"     Training task: 'any abnormal vs normal' (diseases_risk label)")
+        print(f"     Evaluation task: 'any abnormal' (diagnosis > 0 for Messidor-2)")
+    elif args.use_dr_head:
         # Force use of DR head from multilabel classifier
         print(f"  Using DR head from multilabel classifier (user-specified)")
         dr_scores = all_probs[:, dr_idx_in_multilabel]

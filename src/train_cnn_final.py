@@ -666,6 +666,16 @@ def run_for_model(model_name: str):
             f"Sens: {val_sens:.4f} | Spec: {val_spec:.4f} | AUC: {val_auc:.4f}"
         )
 
+        # Write metrics to CSV for this epoch
+        csv_line = (
+            f"{epoch},{train_loss:.6f},{train_bal_acc:.6f},"
+            f"{train_sens:.6f},{train_spec:.6f},"
+            f"{val_loss:.6f},{val_bal_acc:.6f},"
+            f"{val_sens:.6f},{val_spec:.6f},{val_auc:.6f}"
+        )
+        with open(METRICS_CSV, "a") as f:
+            f.write(csv_line + "\n")
+
         # Save best AUC checkpoint
         if val_auc > best_val_auc:
             best_val_auc = val_auc

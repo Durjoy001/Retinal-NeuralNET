@@ -4,3 +4,5 @@ __pycache__
 # Exclude results folder and all contents
 results/
 results_old/
+results_oldV2
+
