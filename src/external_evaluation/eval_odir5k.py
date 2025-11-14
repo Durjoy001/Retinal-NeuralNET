@@ -40,12 +40,16 @@ def vit_transforms(model_name: str, train: bool):
     cfg = resolve_data_config({}, model=m)
     return create_transform(**cfg, is_training=train)
 
-def build_model(model_name, num_classes):
+def build_model(model_name, num_classes, include_binary_head=False):
+    """
+    Build ViT model with optional binary head for Disease_Risk.
+    If include_binary_head=True, returns model with both multilabel and binary heads.
+    """
     model_name = model_name.lower()
     if model_name == "swin_tiny":
         backbone = timm.create_model('swin_tiny_patch4_window7_224', pretrained=True, num_classes=0, drop_path_rate=0.2)
     elif model_name == "vit_small":
-        backbone = timm.create_model('vit_small_patch16_224', pretrained=True, num_classes=0, drop_path_rate=0.2)
+        backbone = timm.create_model('vit_small_patch16_224', pretrained=True, num_classes=0, drop_path_rate=0.25)
     elif model_name == "deit_small":
         backbone = timm.create_model('deit_small_patch16_224', pretrained=True, num_classes=0, drop_path_rate=0.2)
     elif model_name == "crossvit_small":
@@ -53,17 +57,46 @@ def build_model(model_name, num_classes):
     else:
         raise ValueError(f"Unknown ViT model name: {model_name}")
     in_f = backbone.num_features
-    classifier = nn.Sequential(
-        nn.Dropout(0.5),
+    
+    # Multi-label classifier head
+    multilabel_classifier = nn.Sequential(
+        nn.Dropout(0.6),
         nn.Linear(in_f, 256),
         nn.ReLU(),
-        nn.Dropout(0.3),
+        nn.Dropout(0.4),
         nn.Linear(256, num_classes)
     )
+    
+    # Binary classifier head (for Disease_Risk - any abnormal vs normal)
+    binary_classifier = None
+    if include_binary_head:
+        binary_classifier = nn.Sequential(
+            nn.Dropout(0.6),
+            nn.Linear(in_f, 256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(256, 1)  # Binary output
+        )
+    
     class ViTWrapper(nn.Module):
-        def __init__(self, b, head): super().__init__(); self.backbone=b; self.classifier=head
-        def forward(self,x): return self.classifier(self.backbone(x))
-    return ViTWrapper(backbone, classifier)
+        def __init__(self, b, multilabel_head, binary_head=None):
+            super().__init__()
+            self.backbone = b
+            self.classifier = multilabel_head  # For backward compatibility
+            self.multilabel_classifier = multilabel_head
+            self.binary_classifier = binary_head
+            
+        def forward(self, x):
+            features = self.backbone(x)
+            multilabel_logits = self.multilabel_classifier(features)
+            
+            if self.binary_classifier is not None:
+                binary_logits = self.binary_classifier(features)
+                return multilabel_logits, binary_logits
+            else:
+                return multilabel_logits
+    
+    return ViTWrapper(backbone, multilabel_classifier, binary_classifier)
 
 # ----------------------
 # ODIR dataset (Any-Abnormal only)
@@ -339,7 +372,7 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
                        odir_df, img_dir, device, batch_size=16,
                        pooling="auto", logitsum_T=1.0, odir_final_pooling="noisyor",
                        use_rfmid_thresholds=False, drisk_idx=None,
-                       recalibrate_frac=0.0, seed=42):
+                       recalibrate_frac=0.0, use_f1max_threshold=False, seed=42):
 
     print(f"  Loading ODIR-5K dataset...")
     tform = vit_transforms(model_name_key, train=False)
@@ -382,34 +415,69 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
     calib_loader = subset_loader(full_ds, calib_idx) if calib_idx is not None else None
     test_loader  = subset_loader(full_ds, test_idx)
 
-    # Build model using RFMiD label size to match head
-    num_classes = len(rfmid_labels)
-    print(f"  Building model: {model_name_key} ({num_classes} classes)...")
-    model = build_model(model_name_key, num_classes=num_classes).to(device)
+    # Check checkpoint first to see if it has binary head
     if not Path(ckpt_path).exists():
         print(f"  ⚠️ Missing checkpoint: {ckpt_path}")
         return None
     print(f"  Loading checkpoint: {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
-    # Handle both "model_state_dict" and raw state dict formats
     state_dict = state.get("model_state_dict", state)
+    
+    # Check if checkpoint has binary_classifier (new model with binary head)
+    has_binary_head_in_ckpt = any(k.startswith("binary_classifier.") for k in state_dict.keys())
+    
+    # Build model using RFMiD label size to match head
+    # Exclude Disease_Risk from num_classes if it exists (for new model architecture)
+    if "Disease_Risk" in rfmid_labels:
+        num_classes = len(rfmid_labels) - 1  # Exclude Disease_Risk from multilabel head
+        print(f"  Building model: {model_name_key} ({num_classes} disease classes + binary head)...")
+    else:
+        num_classes = len(rfmid_labels)
+        print(f"  Building model: {model_name_key} ({num_classes} classes)...")
+    
+    # Build model with binary head if checkpoint has it
+    model = build_model(model_name_key, num_classes=num_classes, include_binary_head=has_binary_head_in_ckpt).to(device)
+    
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     
     # Compatibility check: Verify classifier weights were loaded
-    # Check for custom MLP classifier (classifier.0 = Dropout, classifier.1 = Linear, classifier.2 = ReLU, classifier.3 = Dropout, classifier.4 = Linear)
-    loaded_any_classifier = any(k.startswith("classifier.") for k in state_dict.keys())
+    # For new models: multilabel_classifier.* and binary_classifier.*
+    # For old models: classifier.*
+    loaded_multilabel_classifier = any(k.startswith("multilabel_classifier.") for k in state_dict.keys())
+    loaded_binary_classifier = any(k.startswith("binary_classifier.") for k in state_dict.keys())
+    loaded_old_classifier = any(k.startswith("classifier.") for k in state_dict.keys())
+    loaded_any_classifier = loaded_multilabel_classifier or loaded_old_classifier
+    
     # Check for TIMM's built-in head (head.* or fc.*, but not our custom classifier.*)
     has_timm_head = any(k.startswith("head.") or k.startswith("fc.") for k in state_dict.keys())
     
     if missing_keys:
-        missing_classifier = [k for k in missing_keys if k.startswith("classifier.")]
-        if missing_classifier:
-            print(f"  ❌ CRITICAL: Missing classifier weights in checkpoint!")
-            print(f"     Missing classifier keys: {missing_classifier[:5]}..." if len(missing_classifier) > 5 else f"     Missing classifier keys: {missing_classifier}")
-            print(f"     This means the classifier head will be RANDOMLY INITIALIZED, causing poor performance!")
-            print(f"     Checkpoint likely used TIMM's built-in head, not the custom MLP head.")
+        # Filter out expected missing keys for new architecture
+        if has_binary_head_in_ckpt:
+            # New model: missing keys might be expected if we're loading old-style checkpoint
+            missing_multilabel = [k for k in missing_keys if k.startswith("multilabel_classifier.")]
+            missing_binary = [k for k in missing_keys if k.startswith("binary_classifier.")]
+            if missing_multilabel or missing_binary:
+                print(f"  ⚠️ Missing classifier keys (new architecture):")
+                if missing_multilabel:
+                    print(f"     Missing multilabel_classifier keys: {missing_multilabel[:3]}..." if len(missing_multilabel) > 3 else f"     Missing multilabel_classifier keys: {missing_multilabel}")
+                if missing_binary:
+                    print(f"     Missing binary_classifier keys: {missing_binary[:3]}..." if len(missing_binary) > 3 else f"     Missing binary_classifier keys: {missing_binary}")
+            else:
+                # Old-style classifier keys missing (expected for new architecture)
+                missing_old_classifier = [k for k in missing_keys if k.startswith("classifier.")]
+                if missing_old_classifier and not loaded_multilabel_classifier:
+                    print(f"  ⚠️ Missing old classifier.* keys (expected for new architecture with multilabel_classifier.*)")
         else:
-            print(f"  ⚠️ Missing keys in checkpoint: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"  ⚠️ Missing keys: {missing_keys}")
+            # Old model: check for missing classifier.*
+            missing_classifier = [k for k in missing_keys if k.startswith("classifier.")]
+            if missing_classifier:
+                print(f"  ❌ CRITICAL: Missing classifier weights in checkpoint!")
+                print(f"     Missing classifier keys: {missing_classifier[:5]}..." if len(missing_classifier) > 5 else f"     Missing classifier keys: {missing_classifier}")
+                print(f"     This means the classifier head will be RANDOMLY INITIALIZED, causing poor performance!")
+                print(f"     Checkpoint likely used TIMM's built-in head, not the custom MLP head.")
+            else:
+                print(f"  ⚠️ Missing keys in checkpoint: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"  ⚠️ Missing keys: {missing_keys}")
     
     if unexpected_keys:
         unexpected_timm_head = [k for k in unexpected_keys if k.startswith("head.") or k.startswith("fc.")]
@@ -422,36 +490,49 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
     
     # Final compatibility assertion
     if not loaded_any_classifier:
-        print(f"  ❌ CRITICAL: No classifier.* weights found in checkpoint!")
-        print(f"     Classifier weights present in checkpoint: {loaded_any_classifier}")
+        print(f"  ❌ CRITICAL: No classifier weights found in checkpoint!")
+        print(f"     Checked for: multilabel_classifier.*, classifier.*")
         print(f"     This means the checkpoint was saved with a different architecture (likely TIMM's built-in head).")
         print(f"     The classifier will be randomly initialized, leading to poor performance.")
         print(f"     Solution: Either retrain with the custom MLP head, or rebuild the eval model to match training.")
     else:
-        print(f"  ✅ Classifier weights present in checkpoint: {loaded_any_classifier}")
+        if has_binary_head_in_ckpt:
+            print(f"  ✅ Multilabel classifier weights present: {loaded_multilabel_classifier}")
+            print(f"  ✅ Binary classifier weights present: {loaded_binary_classifier}")
+        else:
+            print(f"  ✅ Classifier weights present in checkpoint: {loaded_any_classifier}")
         if has_timm_head:
             print(f"  ⚠️ WARNING: Checkpoint contains both custom classifier.* and TIMM head.*/fc.* keys.")
             print(f"     This is unusual. The custom classifier will be used, but verify checkpoint compatibility.")
     
     model.eval()
     print(f"  ✅ Model loaded and set to eval mode")
+    
+    if has_binary_head_in_ckpt:
+        print(f"  ✅ Binary Disease_Risk head detected in checkpoint - will use directly (no pooling needed!)")
 
     # Disease_Risk setup
     has_drisk = ("Disease_Risk" in rfmid_labels)
     if has_drisk:
         drisk_idx = rfmid_labels.index("Disease_Risk")
-        print(f"  ✅ Disease_Risk found at index {drisk_idx} (will use for any-abnormal pooling)")
+        print(f"  ✅ Disease_Risk found at index {drisk_idx}")
 
     # Decide pooling behavior
-    # For ODIR-5K evaluation, prefer odir_map to align semantic space between RFMiD and ODIR
+    # PRIORITY: If model has binary head, use it directly (best option)
     if pooling == "auto":
-        # Prefer odir_map for ODIR-5K (aligns RFMiD→ODIR semantic space)
-        # Fallback to drisk if mapping fails, then noisyor
-        pooling_mode = "odir_map"  # Always prefer mapping for ODIR evaluation
-        print(f"  Pooling mode: {pooling_mode} (auto-selected for ODIR-5K: aligns RFMiD→ODIR semantic space)")
+        if has_binary_head_in_ckpt:
+            pooling_mode = "binary_head"  # Best option: use trained binary head directly
+            print(f"  Pooling mode: {pooling_mode} (auto-selected: using trained binary Disease_Risk head)")
+        else:
+            # Prefer odir_map for ODIR-5K (aligns RFMiD→ODIR semantic space)
+            pooling_mode = "odir_map"
+            print(f"  Pooling mode: {pooling_mode} (auto-selected for ODIR-5K: aligns RFMiD→ODIR semantic space)")
     else:
         pooling_mode = pooling
         print(f"  Pooling mode: {pooling_mode} (user-specified)")
+        # Validate that binary head exists if user forces "binary_head" mode
+        if pooling_mode == "binary_head" and not has_binary_head_in_ckpt:
+            raise ValueError(f"Binary head not found in checkpoint, but pooling='binary_head' was requested. Use a checkpoint trained with train_vit_update.py")
         # Validate that Disease_Risk exists if user forces "drisk" mode
         if pooling_mode == "drisk" and not has_drisk:
             raise ValueError(f"Disease_Risk not found in RFMiD labels, but pooling='drisk' was requested. Available labels: {rfmid_labels[:5]}...")
@@ -502,45 +583,63 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
         with torch.inference_mode():
             for batch_idx, (x, y) in enumerate(loader, 1):
                 x = x.to(device)
-                logits = model(x)
+                outputs = model(x)
+                
+                # Handle both single output (old model) and tuple output (new model with binary head)
+                if isinstance(outputs, tuple):
+                    multilabel_logits, binary_logits = outputs
+                else:
+                    multilabel_logits = outputs
+                    binary_logits = None
                 
                 # Apply temperature scaling if provided
                 if temperature is not None and temperature != 1.0:
-                    logits = logits / max(float(temperature), 1e-3)
+                    if binary_logits is not None:
+                        binary_logits = binary_logits / max(float(temperature), 1e-3)
+                    multilabel_logits = multilabel_logits / max(float(temperature), 1e-3)
                 
                 # Store logits if requested
                 if return_logits:
-                    all_logits.append(logits.cpu().numpy())
-                
-                probs = torch.sigmoid(logits).cpu().numpy()  # [B, C]
-                if pooling_mode == "drisk":
-                    pooled = probs[:, drisk_idx]
-                elif pooling_mode == "odir_map":
-                    # Map RFMiD -> ODIR classes, then Any-Abn across active classes only
-                    odir_probs = {}
-                    for cls in ["D", "G", "C", "A", "H", "M", "O"]:
-                        odir_probs[cls] = noisyor_over_indices(probs, odir_mapping[cls])
-                    # Stack only active classes (drop empty ones except C)
-                    odir_vec_list = [odir_probs[cls] for cls in odir_active_classes]
-                    if odir_vec_list:
-                        odir_vec = np.stack(odir_vec_list, axis=1)  # [B, num_active]
-                        # Use specified final pooling method (noisyor or logitsum)
-                        if odir_final_pooling == "logitsum":
-                            pooled = pool_any(odir_vec, mode="logitsum", T=logitsum_T)
-                        else:  # default: noisyor
-                            pooled = 1.0 - np.prod(1.0 - np.clip(odir_vec, 1e-6, 1-1e-6), axis=1)
+                    if binary_logits is not None:
+                        all_logits.append(binary_logits.cpu().numpy())
                     else:
-                        # Fallback: if all classes are empty, use noisyor over all RFMiD classes
-                        print("  ⚠️ All ODIR classes empty, falling back to noisyor over all RFMiD classes")
-                        pooled = pool_any(probs, mode="noisyor")
-                elif pooling_mode == "noisyor":
-                    pooled = pool_any(probs, mode="noisyor")
-                elif pooling_mode == "max":
-                    pooled = pool_any(probs, mode="max")
-                elif pooling_mode == "logitsum":
-                    pooled = pool_any(probs, mode="logitsum", T=logitsum_T)
+                        all_logits.append(multilabel_logits.cpu().numpy())
+                
+                # Use binary head directly if available (best option)
+                if pooling_mode == "binary_head":
+                    if binary_logits is None:
+                        raise ValueError("binary_head pooling mode requested but model doesn't have binary head")
+                    pooled = torch.sigmoid(binary_logits.squeeze()).cpu().numpy()  # [B]
                 else:
-                    raise ValueError("Unknown pooling mode")
+                    probs = torch.sigmoid(multilabel_logits).cpu().numpy()  # [B, C]
+                    if pooling_mode == "drisk":
+                        pooled = probs[:, drisk_idx]
+                    elif pooling_mode == "odir_map":
+                        # Map RFMiD -> ODIR classes, then Any-Abn across active classes only
+                        odir_probs = {}
+                        for cls in ["D", "G", "C", "A", "H", "M", "O"]:
+                            odir_probs[cls] = noisyor_over_indices(probs, odir_mapping[cls])
+                        # Stack only active classes (drop empty ones except C)
+                        odir_vec_list = [odir_probs[cls] for cls in odir_active_classes]
+                        if odir_vec_list:
+                            odir_vec = np.stack(odir_vec_list, axis=1)  # [B, num_active]
+                            # Use specified final pooling method (noisyor or logitsum)
+                            if odir_final_pooling == "logitsum":
+                                pooled = pool_any(odir_vec, mode="logitsum", T=logitsum_T)
+                            else:  # default: noisyor
+                                pooled = 1.0 - np.prod(1.0 - np.clip(odir_vec, 1e-6, 1-1e-6), axis=1)
+                        else:
+                            # Fallback: if all classes are empty, use noisyor over all RFMiD classes
+                            print("  ⚠️ All ODIR classes empty, falling back to noisyor over all RFMiD classes")
+                            pooled = pool_any(probs, mode="noisyor")
+                    elif pooling_mode == "noisyor":
+                        pooled = pool_any(probs, mode="noisyor")
+                    elif pooling_mode == "max":
+                        pooled = pool_any(probs, mode="max")
+                    elif pooling_mode == "logitsum":
+                        pooled = pool_any(probs, mode="logitsum", T=logitsum_T)
+                    else:
+                        raise ValueError("Unknown pooling mode")
                 y_score.append(pooled)
                 y_true.append(y.numpy())
                 
@@ -568,7 +667,10 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
         y_c_temp, _, logits_c = collect_scores(calib_loader, "calibration", return_logits=True)
         
         # Extract the pooled logit that will be thresholded
-        if pooling_mode == "drisk":
+        if pooling_mode == "binary_head":
+            # Binary head logits are already 1D [N]
+            l_c_pooled = logits_c.squeeze() if logits_c.ndim > 1 else logits_c
+        elif pooling_mode == "drisk":
             l_c_pooled = logits_c[:, drisk_idx]
         elif pooling_mode == "odir_map":
             # Compute pooled prob from unscaled logits, then convert to logit
@@ -614,14 +716,26 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
             print(f"  ⚠️ Cannot fit temperature: only one class in calibration set")
         
         # Step 2: Calibrate threshold on temperature-scaled calibration scores
-        print(f"\n  📊 Calibrating threshold on temperature-scaled calibration set (target: 80% specificity)...")
         y_c, s_c = collect_scores(calib_loader, "calibration", temperature=temperature)
         # Guard calibration threshold computation
         if len(unique_classes_calib) < 2:
             print(f"  ⚠️ Warning: Only one class in calibration set, cannot compute threshold")
+            calib_thr = None
         else:
-            calib_thr, spec_at_thr, sens_at_thr = pick_thr_for_specificity(y_c, s_c, target_spec=0.80)
-            print(f"  ✅ Calibrated threshold: {calib_thr:.6f} (gives spec={spec_at_thr:.3f}, sens={sens_at_thr:.3f} on calibration set)")
+            if use_f1max_threshold:
+                print(f"\n  📊 Calibrating threshold on temperature-scaled calibration set (using F1max)...")
+                f1max_c, thr_f1_c, prec_f1_c, rec_f1_c = compute_f1max(y_c, s_c)
+                calib_thr = thr_f1_c
+                sens_at_thr = rec_f1_c
+                # Calculate specificity at F1max threshold
+                fpr, tpr, thresholds = roc_curve(y_c, s_c)
+                idx = np.argmin(np.abs(thresholds - thr_f1_c))
+                spec_at_thr = 1.0 - fpr[idx] if idx < len(fpr) else 0.0
+                print(f"  ✅ Calibrated threshold (F1max): {calib_thr:.6f} (gives F1={f1max_c:.3f}, prec={prec_f1_c:.3f}, rec={sens_at_thr:.3f}, spec={spec_at_thr:.3f} on calibration set)")
+            else:
+                print(f"\n  📊 Calibrating threshold on temperature-scaled calibration set (target: 80% specificity)...")
+                calib_thr, spec_at_thr, sens_at_thr = pick_thr_for_specificity(y_c, s_c, target_spec=0.80)
+                print(f"  ✅ Calibrated threshold: {calib_thr:.6f} (gives spec={spec_at_thr:.3f}, sens={sens_at_thr:.3f} on calibration set)")
 
     # Evaluate on test split (with temperature scaling if available)
     print(f"\n  📊 Evaluating on test set...")
@@ -699,6 +813,12 @@ def eval_model_on_odir(model_name_disp, model_name_key, ckpt_path, thresholds_pa
     # Threshold-based metrics only computed if not single class
     if not single_class:
         print(f"\n  Computing metrics at different thresholds...")
+        
+        # Always compute F1max threshold metrics
+        f1max_thr_metrics = eval_at_thr("F1max", thr_f1)
+        results.update(f1max_thr_metrics)
+        print(f"    F1max: threshold={thr_f1:.6f}, sens={f1max_thr_metrics['F1max_Sensitivity']:.3f}, spec={f1max_thr_metrics['F1max_Specificity']:.3f}, F1={f1max:.3f}")
+        
         thr80, spec80, sens80 = pick_thr_for_specificity(y_t, s_t, target_spec=0.80)
         results.update(eval_at_thr("Spec80_onTest", thr80))
         print(f"    Spec80_onTest: threshold={thr80:.6f}, sens={sens80:.3f}, spec={spec80:.3f}")
@@ -751,13 +871,23 @@ def main(args):
     odir_df = pd.read_excel(args.odir_xlsx)
 
     # Models + paths (adjust if your tree differs)
+    # All models now use the updated checkpoints with binary head (trained with train_vit_update.py)
+    # Using binary Disease_Risk head checkpoint (best for any-abnormal detection)
     model_cfgs = {
-        "SwinTiny":      {"name": "swin_tiny",      "ckpt": "results/ViT/SwinTiny/swin_tiny_rfmid_best.pth",      "thr": "results/ViT/SwinTiny/optimal_thresholds.npy"},
-        "ViTSmall":      {"name": "vit_small",      "ckpt": "results/ViT/ViTSmall/vit_small_rfmid_best.pth",      "thr": "results/ViT/ViTSmall/optimal_thresholds.npy"},
-        "DeiTSmall":     {"name": "deit_small",     "ckpt": "results/ViT/DeiTSmall/deit_small_rfmid_best.pth",    "thr": "results/ViT/DeiTSmall/optimal_thresholds.npy"},
-        "CrossViTSmall": {"name": "crossvit_small", "ckpt": "results/ViT/CrossViTSmall/crossvit_small_rfmid_best.pth","thr":"results/ViT/CrossViTSmall/optimal_thresholds.npy"},
+        "SwinTiny":      {"name": "swin_tiny",      "ckpt": "results/ViT/SwinTiny/Updated/swin_tiny_rfmid_best_any_abnormal.pth", "thr": "results/ViT/SwinTiny/Updated/optimal_thresholds.npy"},
+        "ViTSmall":      {"name": "vit_small",      "ckpt": "results/ViT/ViTSmall/Updated/vit_small_rfmid_best_any_abnormal.pth", "thr": "results/ViT/ViTSmall/Updated/optimal_thresholds.npy"},
+        "DeiTSmall":     {"name": "deit_small",     "ckpt": "results/ViT/DeiTSmall/Updated/deit_small_rfmid_best_any_abnormal.pth", "thr": "results/ViT/DeiTSmall/Updated/optimal_thresholds.npy"},
+        "CrossViTSmall": {"name": "crossvit_small", "ckpt": "results/ViT/CrossViTSmall/Updated/crossvit_small_rfmid_best_any_abnormal.pth", "thr": "results/ViT/CrossViTSmall/Updated/optimal_thresholds.npy"},
     }
 
+    # Filter models if --model argument is provided
+    if args.model:
+        available_models = list(model_cfgs.keys())
+        if args.model not in model_cfgs:
+            print(f"❌ Model '{args.model}' not found. Available models: {available_models}")
+            return
+        model_cfgs = {args.model: model_cfgs[args.model]}
+    
     summary = []
     for disp, cfg in model_cfgs.items():
         print(f"\n========== {disp} (Any-Abnormal on ODIR-5K) ==========")
@@ -779,6 +909,7 @@ def main(args):
             odir_final_pooling=args.odir_final_pooling,
             use_rfmid_thresholds=args.use_rfmid_thresholds,
             recalibrate_frac=args.recalibrate_frac,
+            use_f1max_threshold=args.use_f1max_threshold,
             seed=args.seed
         )
 
@@ -832,16 +963,20 @@ if __name__ == "__main__":
     p.add_argument("--odir_img_dir", required=True, help="Folder with ODIR training images (contains the Left/Right filenames).")
     p.add_argument("--rfmid_train_csv", required=True, help="Path to RFMiD training labels CSV to get label schema.")
     p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--pooling", choices=["auto","noisyor","max","logitsum","drisk","odir_map"], default="auto",
-                   help="auto: Disease_Risk if present else Noisy-OR; 'odir_map' maps RFMiD classes into ODIR classes before Any-Abn.")
+    p.add_argument("--pooling", choices=["auto","noisyor","max","logitsum","drisk","odir_map","binary_head"], default="auto",
+                   help="auto: binary_head if available, else odir_map; 'binary_head': use trained binary Disease_Risk head directly (best for new models); 'odir_map': maps RFMiD classes into ODIR classes before Any-Abn.")
     p.add_argument("--logitsum_T", type=float, default=1.0, help="Temperature for logitsum pooling.")
     p.add_argument("--odir_final_pooling", choices=["noisyor", "logitsum"], default="noisyor",
                    help="Final pooling method for odir_map mode: 'noisyor' (default) or 'logitsum' (less sensitive to long tails, use with --logitsum_T > 1).")
     p.add_argument("--use_rfmid_thresholds", action="store_true",
                    help="If set, apply RFMiD per-class threshold for Disease_Risk from optimal_thresholds.npy.")
     p.add_argument("--recalibrate_frac", type=float, default=0.2,
-                   help="Fraction of ODIR used ONLY to calibrate temperature scaling + spec≈0.80 threshold (no training). "
+                   help="Fraction of ODIR used ONLY to calibrate temperature scaling + threshold (no training). "
                         "Default 0.2. Set to 0.0 to disable. RECOMMENDED for odir_map pooling to lift sensitivity.")
+    p.add_argument("--use_f1max_threshold", action="store_true",
+                   help="Use F1max threshold instead of 80%% specificity for calibration. Better for screening (higher sensitivity).")
+    p.add_argument("--model", type=str, default=None,
+                   help="Evaluate only this model (e.g., 'SwinTiny', 'ViTSmall'). If not specified, evaluates all models.")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
     main(args)

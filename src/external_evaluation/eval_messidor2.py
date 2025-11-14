@@ -151,13 +151,14 @@ class ModelAdapter:
         raise NotImplementedError
 
 class TimmBackboneWithHead(ModelAdapter):
-    """Generic adapter for timm models with a standard head."""
-    def __init__(self, timm_name: str, num_classes: int, drop_path: float = 0.2, head_dim: int = 256, fallback_names: list = None):
+    """Generic adapter for timm models with a standard head. Supports binary head for new architecture."""
+    def __init__(self, timm_name: str, num_classes: int, drop_path: float = 0.2, head_dim: int = 256, fallback_names: list = None, include_binary_head: bool = False):
         super().__init__(timm_name, num_classes)
         self.timm_name = timm_name
         self.fallback_names = fallback_names or []
         self.drop_path = drop_path
         self.head_dim = head_dim
+        self.include_binary_head = include_binary_head
 
     def build(self) -> nn.Module:
         # Try primary name, then fallbacks if provided
@@ -166,7 +167,9 @@ class TimmBackboneWithHead(ModelAdapter):
         used_name = None
         for name in candidates:
             try:
-                backbone = timm.create_model(name, pretrained=True, num_classes=0, drop_path_rate=self.drop_path)
+                # Use updated drop_path_rate for vit_small if binary head
+                drop_path_rate = 0.25 if (self.include_binary_head and "vit_small" in name) else self.drop_path
+                backbone = timm.create_model(name, pretrained=True, num_classes=0, drop_path_rate=drop_path_rate)
                 used_name = name
                 break
             except Exception as e:
@@ -178,26 +181,50 @@ class TimmBackboneWithHead(ModelAdapter):
             print(f"⚠️  Note: Using fallback timm model '{used_name}' instead of '{self.timm_name}'")
         
         in_f = backbone.num_features
-        head = nn.Sequential(
-            nn.Dropout(0.5),
+        
+        # Multi-label classifier head
+        # Use updated dropout rates for new architecture
+        dropout1 = 0.6 if self.include_binary_head else 0.5
+        dropout2 = 0.4 if self.include_binary_head else 0.3
+        multilabel_head = nn.Sequential(
+            nn.Dropout(dropout1),
             nn.Linear(in_f, self.head_dim),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout2),
             nn.Linear(self.head_dim, self.num_classes),
         )
+        
+        # Binary classifier head (for Disease_Risk - any abnormal vs normal)
+        binary_head = None
+        if self.include_binary_head:
+            binary_head = nn.Sequential(
+                nn.Dropout(dropout1),
+                nn.Linear(in_f, self.head_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout2),
+                nn.Linear(self.head_dim, 1)  # Binary output
+            )
+        
         class Wrapper(nn.Module):
-            def __init__(self, backbone, classifier):
+            def __init__(self, backbone, multilabel_classifier, binary_classifier=None):
                 super().__init__()
                 self.backbone = backbone
-                self.classifier = classifier
+                self.classifier = multilabel_classifier  # For backward compatibility
+                self.multilabel_classifier = multilabel_classifier
+                self.binary_classifier = binary_classifier
             def forward(self, x):
                 z = self.backbone(x)
-                out = self.classifier(z)
-                # If a timm model returns tuple (rare in eval), take first
-                if isinstance(out, tuple):
-                    out = out[0]
-                return out
-        return Wrapper(backbone, head)
+                multilabel_out = self.multilabel_classifier(z)
+                
+                if self.binary_classifier is not None:
+                    binary_out = self.binary_classifier(z)
+                    return multilabel_out, binary_out
+                else:
+                    # If a timm model returns tuple (rare in eval), take first
+                    if isinstance(multilabel_out, tuple):
+                        multilabel_out = multilabel_out[0]
+                    return multilabel_out
+        return Wrapper(backbone, multilabel_head, binary_head)
 
     def transforms(self, is_train: bool):
         # Use the same fallback logic as build() for consistency
@@ -460,13 +487,48 @@ def _find_label_index(label_columns, aliases):
     return None
 
 def _best_existing_path(stem, exts=(".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG")):
+    # First check if the path already exists (id_code might already include extension)
+    if stem.exists():
+        return stem
+    
+    # If not, try adding each extension
     for ext in exts:
         p = stem.with_suffix(ext)
         if p.exists():
             return p
-    if stem.exists():
-        return stem
-    raise FileNotFoundError(f"Image not found for ID: {stem.name}. Tried extensions: {exts}")
+    
+    # Also try without any extension changes (in case stem already has extension)
+    # Check if any file with similar name exists
+    parent = stem.parent
+    name = stem.name
+    for ext in exts:
+        # Try exact name with extension
+        p = parent / (name + ext)
+        if p.exists():
+            return p
+        # Try name without current extension + new extension
+        name_no_ext = stem.stem
+        p = parent / (name_no_ext + ext)
+        if p.exists():
+            return p
+    
+    # If still not found, search in subdirectories (common for Messidor-2)
+    import glob
+    parent = stem.parent
+    name_pattern = stem.stem  # Name without extension
+    for ext in exts:
+        # Search recursively for files matching the pattern
+        pattern = str(parent / "**" / f"{name_pattern}*{ext}")
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            return Path(matches[0])
+        # Also try with full name (in case it already has extension)
+        pattern = str(parent / "**" / f"{name}*{ext}")
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            return Path(matches[0])
+    
+    raise FileNotFoundError(f"Image not found for ID: {stem.name}. Tried path: {stem}. Tried extensions: {exts}. Searched in: {parent}")
 
 # ============================
 # Metrics
@@ -529,15 +591,18 @@ class Messidor2Dataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        stem = self.images_dir / str(row["id_code"])
+        id_code = str(row["id_code"])
+        # id_code might already include extension, or might not
+        # Try direct path first, then try with extensions
+        stem = self.images_dir / id_code
         img_path = _best_existing_path(stem)
         try:
             img = Image.open(img_path).convert("RGB")
         except Exception as e:
-            raise RuntimeError(f"Failed to load image at {img_path} for ID {row['id_code']}: {e}")
+            raise RuntimeError(f"Failed to load image at {img_path} for ID {id_code}: {e}")
         if self.transform:
             img = self.transform(img)
-        return img, str(row["id_code"])
+        return img, id_code
 
 # ============================
 # Main
@@ -553,6 +618,7 @@ def main():
     ap.add_argument("--results_dir", required=True, help="Output directory for metrics")
     ap.add_argument("--any_thr", type=float, default=None, help="Override any-abnormal threshold (defaults to DR threshold)")
     ap.add_argument("--use_f1max_threshold", action="store_true", help="Use F1max threshold instead of RFMiD threshold (better for domain shift)")
+    ap.add_argument("--use_dr_head", action="store_true", help="Force use of DR head from multilabel classifier instead of binary head (for comparison). Default: use binary head if available.")
     ap.add_argument("--target_specificity", type=float, default=None, help="Use threshold that achieves target specificity (e.g., 0.8 for 80% specificity). Overrides --use_f1max_threshold if set.")
     ap.add_argument("--target_sensitivity", type=float, default=None, help="Use threshold that achieves target sensitivity on Messidor-2 validation split (e.g., 0.85 for 85% sensitivity). Best for domain adaptation.")
     ap.add_argument("--threshold_method", type=str, default="youden", choices=["youden", "f1max", "sensitivity", "specificity"], 
@@ -587,14 +653,40 @@ def main():
     rfmid_train = pd.read_csv(args.rfmid_train_csv)
     label_columns = [c for c in rfmid_train.columns if c != "ID"]
     thresholds = np.load(args.thresholds)
-    if len(thresholds) != len(label_columns):
-        raise ValueError("Threshold length does not match number of RFMiD label columns.")
+    
+    # Check if checkpoint has binary head (affects expected threshold count)
+    ckpt_preview = torch.load(args.checkpoint, map_location="cpu")
+    state_preview = ckpt_preview.get("model_state_dict", ckpt_preview)
+    has_binary_head_in_ckpt = any(k.startswith("binary_classifier.") for k in state_preview.keys())
+    
+    # Thresholds file should have one threshold per disease class (excludes Disease_Risk if binary head exists)
+    expected_threshold_count = len(label_columns) - (1 if ("Disease_Risk" in label_columns and has_binary_head_in_ckpt) else 0)
+    
+    if len(thresholds) != expected_threshold_count:
+        raise ValueError(f"Threshold length mismatch: expected {expected_threshold_count} thresholds (for {len(label_columns)} label columns, "
+                        f"{'excluding Disease_Risk' if has_binary_head_in_ckpt and 'Disease_Risk' in label_columns else 'including all'}), "
+                        f"but got {len(thresholds)} thresholds in file.")
 
     dr_idx = _find_label_index(label_columns, DR_ALIASES)
     if dr_idx is None:
         raise ValueError(f"Could not find DR column in RFMiD labels. Checked aliases: {DR_ALIASES}")
 
-    tau_dr = float(thresholds[dr_idx])
+    # Map dr_idx to thresholds array index and multilabel probabilities index
+    # If Disease_Risk is excluded from multilabel head (binary head model), adjust index
+    if "Disease_Risk" in label_columns and has_binary_head_in_ckpt:
+        # Find Disease_Risk index in label_columns
+        drisk_idx_in_labels = label_columns.index("Disease_Risk")
+        # If DR comes after Disease_Risk, subtract 1 from dr_idx
+        if dr_idx > drisk_idx_in_labels:
+            dr_idx_in_multilabel = dr_idx - 1
+        else:
+            dr_idx_in_multilabel = dr_idx
+    else:
+        dr_idx_in_multilabel = dr_idx
+    
+    # For thresholds, use the same mapping
+    dr_idx_in_thresholds = dr_idx_in_multilabel
+    tau_dr = float(thresholds[dr_idx_in_thresholds])
     # Default: use threshold_method (Youden's J) on validation split
     # All threshold adaptation methods will compute threshold on validation split to prevent test leakage
     if args.any_thr is not None:
@@ -668,8 +760,24 @@ def main():
     y_dr = (mdf_test["diagnosis"].astype(int) > 0).astype(np.int32).values
     y_dr_referr = (mdf_test["diagnosis"].astype(int) >= 2).astype(np.int32).values if args.with_referable_dr else None
 
+    # Check checkpoint first to see if it has binary head
+    # (Already loaded above for threshold check, but reload here for model building)
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    state = ckpt.get("model_state_dict", ckpt)
+    
+    # Check if checkpoint has binary_classifier (new model with binary head)
+    # (Already computed above, but recompute here for clarity)
+    has_binary_head_in_ckpt = any(k.startswith("binary_classifier.") for k in state.keys())
+    
     # Build model via adapter
-    num_classes = len(label_columns)
+    # Exclude Disease_Risk from num_classes if it exists (for new model architecture)
+    if "Disease_Risk" in label_columns:
+        num_classes = len(label_columns) - 1  # Exclude Disease_Risk from multilabel head
+        if has_binary_head_in_ckpt:
+            print(f"✅ Binary Disease_Risk head detected in checkpoint - will use for Messidor-2 (DR-only dataset)")
+    else:
+        num_classes = len(label_columns)
+    
     model_name_lower = args.model_name.lower()
     
     # Special handling for CLIP and SigLIP (need class_names)
@@ -680,14 +788,27 @@ def main():
     elif "siglip" in model_name_lower:
         adapter = SigLIPAdapter(model_name_lower, num_classes, label_columns)
     elif model_name_lower in REGISTRY:
-        adapter = REGISTRY[model_name_lower](num_classes)
+        # For ViT models, check if we need binary head
+        if model_name_lower in ["swin_tiny", "vit_small", "deit_small", "crossvit_small"] and has_binary_head_in_ckpt:
+            # Map model names to timm identifiers
+            timm_name_map = {
+                "swin_tiny": "swin_tiny_patch4_window7_224",
+                "vit_small": "vit_small_patch16_224",
+                "deit_small": "deit_small_patch16_224",
+                "crossvit_small": "crossvit_15_240",
+            }
+            adapter = TimmBackboneWithHead(
+                timm_name_map[model_name_lower],
+                num_classes,
+                drop_path=0.25 if model_name_lower == "vit_small" else 0.2,
+                include_binary_head=True
+            )
+        else:
+            adapter = REGISTRY[model_name_lower](num_classes)
     else:
         raise ValueError(f"Unknown model: {args.model_name}. Available: {list(REGISTRY.keys())}")
 
     model = adapter.build().to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    # Handle both "model_state_dict" and raw state dict formats
-    state = ckpt.get("model_state_dict", ckpt)
     
     # Fix key mismatches (checkpoint may have different prefixes)
     model_keys = set(model.state_dict().keys())
@@ -731,11 +852,19 @@ def main():
     
     model.eval()
 
+    # Auto-adjust image size for ViT models (trained with 224x224)
+    # ViT models require exact input size match
+    eval_img_size = args.eval_img_size
+    if model_name_lower in ["swin_tiny", "vit_small", "deit_small", "crossvit_small"]:
+        if eval_img_size != 224:
+            print(f"⚠️  Warning: ViT models require 224x224 input (trained size). Overriding eval_img_size from {eval_img_size} to 224.")
+            eval_img_size = 224
+    
     # Use enhanced eval transform (larger input, optional CLAHE, square padding)
     use_clahe = not args.disable_clahe
-    tfm = build_eval_transform(img_size=args.eval_img_size, use_clahe=use_clahe)
+    tfm = build_eval_transform(img_size=eval_img_size, use_clahe=use_clahe)
     clahe_str = "with CLAHE" if use_clahe else "without CLAHE"
-    print(f"Using enhanced eval transform: {args.eval_img_size}x{args.eval_img_size} {clahe_str} and square padding")
+    print(f"Using enhanced eval transform: {eval_img_size}x{eval_img_size} {clahe_str} and square padding")
     
     # Create datasets
     ds_test = Messidor2Dataset(Path(args.images_dir), mdf_test, tfm)
@@ -805,6 +934,7 @@ def main():
     def run_inference(dataloader, dataset_name="test", temperature=1.0):
         """Run inference with optional TTA and temperature scaling."""
         all_logits = []
+        all_binary_logits = [] if has_binary_head_in_ckpt else None
         all_ids = []
         total_batches = len(dataloader)
         print(f"Running inference on {len(dataloader.dataset)} {dataset_name} images ({total_batches} batches)...")
@@ -821,26 +951,48 @@ def main():
                 if args.use_tta:
                     tta_transforms = get_tta_transforms(xb)
                     logits_list = []
+                    binary_logits_list = [] if has_binary_head_in_ckpt else None
                     for xb_aug in tta_transforms:
-                        logits = model(xb_aug)
-                        if hasattr(logits, "logits"):
-                            logits = logits.logits
-                        elif isinstance(logits, (tuple, list)):
-                            logits = logits[0]
-                        logits_list.append(logits)
+                        outputs = model(xb_aug)
+                        # Handle both single output (old model) and tuple output (new model with binary head)
+                        if isinstance(outputs, tuple):
+                            multilabel_logits, binary_logits = outputs
+                            if binary_logits_list is not None:
+                                binary_logits_list.append(binary_logits)
+                        else:
+                            multilabel_logits = outputs
+                            if hasattr(multilabel_logits, "logits"):
+                                multilabel_logits = multilabel_logits.logits
+                            elif isinstance(multilabel_logits, (tuple, list)):
+                                multilabel_logits = multilabel_logits[0]
+                        logits_list.append(multilabel_logits)
                     logits_avg = torch.stack(logits_list).mean(dim=0)
+                    if binary_logits_list is not None:
+                        binary_logits_avg = torch.stack(binary_logits_list).mean(dim=0)
+                    else:
+                        binary_logits_avg = None
                 else:
-                    logits = model(xb)
-                    if hasattr(logits, "logits"):
-                        logits = logits.logits
-                    elif isinstance(logits, (tuple, list)):
-                        logits = logits[0]
-                    logits_avg = logits
+                    outputs = model(xb)
+                    # Handle both single output (old model) and tuple output (new model with binary head)
+                    if isinstance(outputs, tuple):
+                        logits_avg, binary_logits_avg = outputs
+                    else:
+                        logits_avg = outputs
+                        binary_logits_avg = None
+                        if hasattr(logits_avg, "logits"):
+                            logits_avg = logits_avg.logits
+                        elif isinstance(logits_avg, (tuple, list)):
+                            logits_avg = logits_avg[0]
                 
                 # Apply temperature scaling
                 logits_scaled = logits_avg / temperature
-                
                 all_logits.append(logits_scaled.cpu())
+                
+                if binary_logits_avg is not None:
+                    binary_logits_scaled = binary_logits_avg / temperature
+                    if all_binary_logits is not None:
+                        all_binary_logits.append(binary_logits_scaled.cpu())
+                
                 all_ids.extend(ids)
                 
                 if batch_idx % 10 == 0 or batch_idx == total_batches:
@@ -848,8 +1000,16 @@ def main():
         
         all_logits = torch.cat(all_logits, dim=0)
         all_probs = torch.sigmoid(all_logits).numpy()
-        print(f"✅ Inference complete: {all_probs.shape[0]} images, {all_probs.shape[1]} classes.")
-        return all_probs, all_ids
+        
+        # If binary head available, use it for Messidor-2 (DR-only, so binary head = any abnormal = DR present)
+        if has_binary_head_in_ckpt and all_binary_logits is not None:
+            all_binary_logits = torch.cat(all_binary_logits, dim=0)
+            binary_probs = torch.sigmoid(all_binary_logits).numpy().squeeze()
+            print(f"✅ Inference complete: {all_probs.shape[0]} images, using binary Disease_Risk head for Messidor-2 (DR-only dataset).")
+            return all_probs, all_ids, binary_probs
+        else:
+            print(f"✅ Inference complete: {all_probs.shape[0]} images, {all_probs.shape[1]} classes.")
+            return all_probs, all_ids, None
     
     # Step 2: Temperature scaling (fit on validation split, apply to test)
     # True one-parameter temperature scaling: minimize NLL w.r.t. T
@@ -877,16 +1037,25 @@ def main():
         
         print(f"  Running inference on {len(dl_train_for_temp.dataset)} images ({total_batches} batches)...")
         all_logits_train_raw = []
+        all_binary_logits_train_raw = [] if has_binary_head_in_ckpt else None
         with torch.inference_mode(), torch.autocast(device_type=dev_type, enabled=(dev_type != "cpu")):
             for batch_idx, (xb, _) in enumerate(dl_train_for_temp, 1):
                 xb = xb.to(device)
                 # Skip TTA for temperature scaling - just need raw logits for calibration
-                logits = model(xb)
-                if hasattr(logits, "logits"):
-                    logits = logits.logits
-                elif isinstance(logits, (tuple, list)):
-                    logits = logits[0]
-                all_logits_train_raw.append(logits.cpu())
+                outputs = model(xb)
+                # Handle both single output (old model) and tuple output (new model with binary head)
+                if isinstance(outputs, tuple):
+                    multilabel_logits, binary_logits = outputs
+                    if all_binary_logits_train_raw is not None:
+                        all_binary_logits_train_raw.append(binary_logits.cpu())
+                    all_logits_train_raw.append(multilabel_logits.cpu())
+                else:
+                    logits = outputs
+                    if hasattr(logits, "logits"):
+                        logits = logits.logits
+                    elif isinstance(logits, (tuple, list)):
+                        logits = logits[0]
+                    all_logits_train_raw.append(logits.cpu())
                 
                 if batch_idx % 20 == 0 or batch_idx == total_batches:
                     print(f"  Processed {batch_idx}/{total_batches} batches ({batch_idx * args.batch_size} images)...", flush=True)
@@ -898,7 +1067,18 @@ def main():
             y_dr_train = (mdf_train.iloc[subset_indices]["diagnosis"].astype(int) > 0).astype(np.int32).values
         else:
             y_dr_train = (mdf_train["diagnosis"].astype(int) > 0).astype(np.int32).values
-        dr_logits_train = all_logits_train_raw[:, dr_idx]  # Keep as tensor
+        
+        # Use binary head logits if available (better calibrated for any abnormal = DR)
+        if args.use_dr_head:
+            # Force use of DR head logits
+            dr_logits_train = all_logits_train_raw[:, dr_idx_in_multilabel]  # Keep as tensor
+            print(f"  Using DR head logits for temperature scaling (user-specified)")
+        elif has_binary_head_in_ckpt and all_binary_logits_train_raw is not None:
+            all_binary_logits_train_raw = torch.cat(all_binary_logits_train_raw, dim=0)
+            dr_logits_train = all_binary_logits_train_raw.squeeze()  # Binary head: [N, 1] -> [N]
+            print(f"  Using binary Disease_Risk head logits for temperature scaling")
+        else:
+            dr_logits_train = all_logits_train_raw[:, dr_idx_in_multilabel]  # Keep as tensor
         
         print("  Optimizing temperature parameter...", flush=True)
         # True temperature scaling: optimize T by minimizing NLL
@@ -925,18 +1105,42 @@ def main():
             temperature = 1.0
     
     # Run inference on test set (with temperature scaling if fitted)
-    all_probs, all_ids = run_inference(dl_test, "test", temperature=temperature)
+    all_probs, all_ids, binary_probs = run_inference(dl_test, "test", temperature=temperature)
     
     # If using threshold selection, also run inference on train set
     # CRITICAL: Always compute thresholds on validation split to prevent test leakage
     if use_val_split:
-        all_probs_train, all_ids_train = run_inference(dl_train, "train (for threshold selection)", temperature=temperature)
-        dr_scores_train = all_probs_train[:, dr_idx]
+        all_probs_train, all_ids_train, binary_probs_train = run_inference(dl_train, "train (for threshold selection)", temperature=temperature)
+        if args.use_dr_head:
+            # Force use of DR head
+            dr_scores_train = all_probs_train[:, dr_idx_in_multilabel]
+        elif has_binary_head_in_ckpt and binary_probs_train is not None:
+            # Use binary head for threshold selection (better calibrated for any abnormal = DR)
+            dr_scores_train = binary_probs_train
+        else:
+            dr_scores_train = all_probs_train[:, dr_idx_in_multilabel]
         y_dr_train = (mdf_train["diagnosis"].astype(int) > 0).astype(np.int32).values
 
     # Scores for endpoints (DR-only for Messidor-2)
-    dr_scores = all_probs[:, dr_idx]
-    any_scores = dr_scores  # DR-only, not max over all classes
+    # Option 1: Binary head (recommended) - trained for "any abnormal vs normal"
+    # Option 2: DR head from multilabel - trained specifically for DR
+    # Default: use binary head if available (better calibrated for binary classification)
+    if args.use_dr_head:
+        # Force use of DR head from multilabel classifier
+        print(f"  Using DR head from multilabel classifier (user-specified)")
+        dr_scores = all_probs[:, dr_idx_in_multilabel]
+        any_scores = dr_scores
+    elif has_binary_head_in_ckpt and binary_probs is not None:
+        # Use binary head (recommended for Messidor-2)
+        print(f"  Using binary Disease_Risk head for Messidor-2 (DR-only dataset)")
+        print(f"    Rationale: Binary head is better calibrated for 'any abnormal vs normal' task")
+        dr_scores = binary_probs
+        any_scores = binary_probs  # Binary head = any abnormal = DR present
+    else:
+        # Fallback: use DR head if binary head not available
+        print(f"  Using DR head from multilabel classifier (binary head not available)")
+        dr_scores = all_probs[:, dr_idx_in_multilabel]
+        any_scores = dr_scores  # DR-only, not max over all classes
 
     # Debug: Print threshold and score distribution
     print(f"\n[Debug] tau_dr (RFMiD): {tau_dr:.6f}")
@@ -948,9 +1152,20 @@ def main():
     # Threshold selection: ALWAYS use validation split to prevent test leakage
     # All threshold adaptation methods compute threshold on validation split only
     # Track which method was actually used for CSV reporting
+    # PRIORITY: target_specificity and target_sensitivity override threshold_method
     threshold_method_used = "rfmid"  # Default
     if use_val_split and tau_any is None:
-        if args.threshold_method == "youden":
+        if args.target_specificity is not None:
+            tau_any, spec_at_thr, sens_at_thr = pick_threshold_for_specificity(y_dr_train, dr_scores_train, target_spec=args.target_specificity)
+            threshold_method_used = f"target_spec_{args.target_specificity:.2f}"
+            print(f"📊 Chosen threshold (target specificity) on Messidor-2 validation: {tau_any:.6f}")
+            print(f"   Gives specificity: {spec_at_thr:.3f} and sensitivity: {sens_at_thr:.3f}")
+        elif args.target_sensitivity is not None:
+            tau_any, got_tpr, got_tnr = threshold_for_tpr(y_dr_train, dr_scores_train, target_tpr=args.target_sensitivity)
+            threshold_method_used = f"target_sens_{args.target_sensitivity:.2f}"
+            print(f"📊 Chosen threshold (target sensitivity) on Messidor-2 validation: {tau_any:.6f}")
+            print(f"   Gives sensitivity: {got_tpr:.3f} and specificity: {got_tnr:.3f}")
+        elif args.threshold_method == "youden":
             tau_any, got_tpr, got_tnr, youden_j = threshold_for_youden_j(y_dr_train, dr_scores_train)
             threshold_method_used = "youden"
             print(f"📊 Chosen threshold (Youden's J) on Messidor-2 validation: {tau_any:.6f}")
@@ -960,16 +1175,6 @@ def main():
             threshold_method_used = "f1max"
             print(f"📊 Chosen threshold (F1max) on Messidor-2 validation: {tau_any:.6f}")
             print(f"   Gives F1: {f1_val:.3f}, precision: {prec_val:.3f}, recall: {rec_val:.3f}")
-        elif args.target_sensitivity is not None:
-            tau_any, got_tpr, got_tnr = threshold_for_tpr(y_dr_train, dr_scores_train, target_tpr=args.target_sensitivity)
-            threshold_method_used = f"target_sens_{args.target_sensitivity:.2f}"
-            print(f"📊 Chosen threshold (target sensitivity) on Messidor-2 validation: {tau_any:.6f}")
-            print(f"   Gives sensitivity: {got_tpr:.3f} and specificity: {got_tnr:.3f}")
-        elif args.target_specificity is not None:
-            tau_any, spec_at_thr, sens_at_thr = pick_threshold_for_specificity(y_dr_train, dr_scores_train, target_spec=args.target_specificity)
-            threshold_method_used = f"target_spec_{args.target_specificity:.2f}"
-            print(f"📊 Chosen threshold (target specificity) on Messidor-2 validation: {tau_any:.6f}")
-            print(f"   Gives specificity: {spec_at_thr:.3f} and sensitivity: {sens_at_thr:.3f}")
         else:
             # Fallback to RFMiD threshold if no method specified
             tau_any = tau_dr

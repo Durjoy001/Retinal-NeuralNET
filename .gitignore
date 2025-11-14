@@ -1,5 +1,6 @@
 data/
 __pycache__
 
-# Exclude large model weight files from results
-results/**/*.pth
+# Exclude results folder and all contents
+results/
+results_old/
