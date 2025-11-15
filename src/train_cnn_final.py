@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Binary CNN training for RFMiD:
-- Single diseases_risk head: 1 means any disease, 0 means normal
-- Hemelings style preprocessing: center crop, resize to 224, Gaussian background subtraction,
+- Single Disease_Risk head: 1 means diseased, 0 means normal
+- Custom preprocessing: center crop, resize to 224, Gaussian background subtraction,
   horizontal flip, brightness shift, gentle elastic deformation
-- ImageNet pretrained CNNs (ResNet50, EfficientNet-B3, InceptionV3, DenseNet121)
+- ImageNet pretrained CNNs (ResNet50, EfficientNet-B3, DenseNet121)
 - Freeze all early layers and train only last N parameter tensors
 - Adam optimizer, BCEWithLogitsLoss, validation AUC checkpointing
 - Threshold calibration for target specificity ~0.80
@@ -27,8 +27,7 @@ from torchvision import transforms, models
 from torchvision.models import (
     DenseNet121_Weights,
     ResNet50_Weights,
-    EfficientNet_B3_Weights,
-    Inception_V3_Weights
+    EfficientNet_B3_Weights
 )
 
 from sklearn.metrics import (
@@ -52,20 +51,19 @@ BATCH_SIZE = 16
 EPOCHS = 20
 LR = 1e-4
 NUM_WORKERS = 0       # 0 is safe on macOS
-PATIENCE = 2          # stop if val balanced accuracy does not improve for 2 epochs
-MIN_DELTA = 1e-4      # minimum improvement to be considered better
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 # ----------------------
 # Paths
 # ----------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT_DIR / "data" / "RFMiD_Challenge_Dataset"
+DATA_DIR = Path("")
 
 RESULTS_DIR = None
 SAVE_PATH = None
 METRICS_CSV = None
 THRESHOLDS_PATH = None
+PREPROCESS_DIR = ROOT_DIR / "preprocess"
 
 # ----------------------
 # Reproducibility
@@ -80,7 +78,7 @@ torch.backends.cudnn.benchmark = False
 
 
 # ----------------------
-# Dataset for binary diseases_risk label
+# Dataset for binary Disease_Risk label
 # ----------------------
 class RFMiDDatasetBinary(Dataset):
     def __init__(self, img_dir, labels_df, label_column, transform=None):
@@ -107,7 +105,62 @@ class RFMiDDatasetBinary(Dataset):
 
 
 # ----------------------
-# Hemelings style preprocessing
+# Simple sanity checks
+# ----------------------
+def preview_random_labels(num_samples: int = 5, dataset: str = "train"):
+    """
+    Print a handful of (ID, Disease_Risk) pairs and confirm the image file exists.
+    """
+    dataset = dataset.lower()
+    groundtruth_paths = {
+        "train": DATA_DIR / "2. Groundtruths" / "a. RFMiD_Training_Labels.csv",
+        "val": DATA_DIR / "2. Groundtruths" / "b. RFMiD_Validation_Labels.csv",
+        "test": DATA_DIR / "2. Groundtruths" / "c. RFMiD_Testing_Labels.csv",
+    }
+    image_dirs = {
+        "train": DATA_DIR / "1. Original Images" / "a. Training Set",
+        "val": DATA_DIR / "1. Original Images" / "b. Validation Set",
+        "test": DATA_DIR / "1. Original Images" / "c. Testing Set",
+    }
+
+    if dataset not in groundtruth_paths:
+        raise ValueError("dataset must be one of: train, val, test")
+
+    labels_path = groundtruth_paths[dataset]
+    img_dir = image_dirs[dataset]
+
+    if not labels_path.exists():
+        print(f"[WARN] Labels CSV not found: {labels_path}")
+        return
+
+    labels_df = pd.read_csv(labels_path)
+    labels_df["ID"] = labels_df["ID"].astype(str)
+
+    if labels_df.empty:
+        print(f"[WARN] No rows found in {labels_path.name}")
+        return
+
+    if "Disease_Risk" not in labels_df.columns:
+        print(f"[WARN] 'Disease_Risk' column not present in {labels_path.name}")
+        return
+
+    random_seed = int(np.random.default_rng().integers(0, 10_000))
+    sample_df = labels_df.sample(
+        n=min(num_samples, len(labels_df)),
+        random_state=random_seed
+    )
+
+    print(f"\nSample {len(sample_df)} entries from {dataset} split:")
+    for row in sample_df.itertuples(index=False):
+        img_id = row.ID
+        risk = getattr(row, "Disease_Risk", None)
+        img_path = img_dir / f"{img_id}.png"
+        status = "FOUND" if img_path.exists() else "MISSING"
+        print(f"  ID={img_id} | Disease_Risk={risk} | Image: {status} ({img_path.name})")
+
+
+# ----------------------
+# Preprocessing helpers
 # ----------------------
 class BackgroundSubtraction(object):
     """
@@ -135,17 +188,8 @@ class BackgroundSubtraction(object):
         sub = np.clip(sub, 0, 255).astype(np.uint8)
         return Image.fromarray(sub)
 
-
-class IdentityTransform(object):
-    def __call__(self, img):
-        return img
-
-
 def get_elastic_transform():
-    # Use torchvision ElasticTransform if available
-    if hasattr(transforms, "ElasticTransform"):
-        return transforms.ElasticTransform(alpha=50.0, sigma=5.0)
-    return IdentityTransform()
+    return transforms.ElasticTransform(alpha=50.0, sigma=5.0)
 
 
 def get_transforms(model_name: str, train: bool):
@@ -183,13 +227,68 @@ def get_transforms(model_name: str, train: bool):
     return transforms.Compose(base_transforms + aug_transforms + to_tensor_and_norm)
 
 
+def _tensor_to_pil_image(tensor: torch.Tensor) -> Image.Image:
+    """
+    Convert a normalized tensor (ImageNet mean/std) back to a PIL image for inspection.
+    """
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+    tensor = tensor.detach().clone()
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    tensor = tensor * std + mean
+    tensor = tensor.clamp(0.0, 1.0)
+    np_image = (tensor.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    return Image.fromarray(np_image)
+
+
+def preview_preprocessing(model_name: str, num_images: int = 2):
+    """
+    Apply the training preprocessing pipeline to a few sample images and save the
+    original/processed pairs so users can inspect them.
+    """
+    PREPROCESS_DIR.mkdir(parents=True, exist_ok=True)
+
+    labels_path = DATA_DIR / "2. Groundtruths" / "a. RFMiD_Training_Labels.csv"
+    labels_df = pd.read_csv(labels_path)
+    sample_rows = labels_df.sample(
+        n=min(num_images, len(labels_df)),
+        random_state=SEED
+    )
+
+    transform = get_transforms(model_name, train=True)
+    img_dir = DATA_DIR / "1. Original Images" / "a. Training Set"
+
+    print(f"\nPreviewing preprocessing for {model_name}...")
+    for idx, row in enumerate(sample_rows.itertuples(), start=1):
+        img_id = row.ID
+        img_path = img_dir / f"{img_id}.png"
+
+        if not img_path.exists():
+            print(f"[WARN] Image not found: {img_path}")
+            continue
+
+        original_img = Image.open(img_path).convert("RGB")
+        processed_tensor = transform(original_img)
+        processed_img = _tensor_to_pil_image(processed_tensor)
+
+        base_name = f"sample_{idx}_{img_id}"
+        original_out = PREPROCESS_DIR / f"{base_name}_original.png"
+        processed_out = PREPROCESS_DIR / f"{base_name}_processed.png"
+
+        original_img.save(original_out)
+        processed_img.save(processed_out)
+
+        print(f"Saved original image to: {original_out}")
+        print(f"Saved processed image to: {processed_out}")
+
 # ----------------------
-# Model builders with binary head (diseases_risk)
+# Model builders with binary head (Disease_Risk)
 # ----------------------
 def build_model(model_name: str):
     """
     Build a CNN with a single binary output:
-    diseases_risk: 1 means any disease present, 0 means normal.
+    Disease_Risk: 1 means diseased, 0 means normal.
     """
     model_name = model_name.lower()
 
@@ -226,24 +325,6 @@ def build_model(model_name: str):
             nn.Linear(256, 1)
         )
 
-    elif model_name == "inception_v3":
-        model = models.inception_v3(
-            weights=Inception_V3_Weights.IMAGENET1K_V1,
-            aux_logits=True
-        )
-        in_f = model.fc.in_features
-        model.fc = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(in_f, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 1)
-        )
-        # Aux head for training
-        if model.AuxLogits is not None:
-            aux_in = model.AuxLogits.fc.in_features
-            model.AuxLogits.fc = nn.Linear(aux_in, 1)
-
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
@@ -253,7 +334,7 @@ def build_model(model_name: str):
 # ----------------------
 # Freezing strategy
 # ----------------------
-def freeze_early_layers_hemelings_style(model: nn.Module, num_trainable_layers: int = 12):
+def freeze_early_layers(model: nn.Module, num_trainable_layers: int = 12):
     """
     Freeze all parameters except the last num_trainable_layers parameter tensors.
     """
@@ -335,13 +416,15 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         FP += fp
         FN += fn
 
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+
     sens, spec, _, bal_acc = compute_sens_spec_acc(TP, TN, FP, FN)
     avg_loss = running_loss / len(loader)
     return avg_loss, bal_acc, sens, spec
 
 
 @torch.no_grad()
-def evaluate_model(model, loader, criterion, device, threshold: float = 0.5):
+def evaluate_model(model, loader, criterion, device, threshold: float = 0.5, desc: str = "Evaluating"):
     model.eval()
     running_loss = 0.0
 
@@ -349,7 +432,7 @@ def evaluate_model(model, loader, criterion, device, threshold: float = 0.5):
     all_probs = []
     all_labels = []
 
-    pbar = tqdm(loader, desc="Evaluating", leave=False)
+    pbar = tqdm(loader, desc=desc, leave=False)
     for images, labels in pbar:
         images = images.to(device)
         labels = labels.to(device)
@@ -486,6 +569,41 @@ def _compute_f1max(y_true_binary, y_score):
     return float(f1_use[best_idx]), float(thr[best_idx]), float(precision[best_idx]), float(recall[best_idx])
 
 
+def _best_balanced_accuracy_threshold(y_true_binary, y_score):
+    if len(np.unique(y_true_binary)) < 2:
+        default_thr = 0.5
+        preds = (y_score >= default_thr).astype(int)
+        tp, tn, fp, fn = compute_confusion_from_preds(y_true_binary, preds)
+        sens, spec, _, bal_acc = compute_sens_spec_acc(tp, tn, fp, fn)
+        return default_thr, bal_acc, sens, spec
+
+    unique_scores = np.unique(y_score)
+    candidate_thresholds = np.concatenate((
+        [unique_scores[0] - 1.0],
+        unique_scores,
+        [unique_scores[-1] + 1.0],
+        [0.5]
+    ))
+    candidate_thresholds = np.unique(candidate_thresholds)
+
+    best_thr = 0.5
+    best_bal_acc = -np.inf
+    best_sens = 0.0
+    best_spec = 0.0
+
+    for thr in candidate_thresholds:
+        preds = (y_score >= thr).astype(int)
+        tp, tn, fp, fn = compute_confusion_from_preds(y_true_binary, preds)
+        sens, spec, _, bal_acc = compute_sens_spec_acc(tp, tn, fp, fn)
+        if bal_acc > best_bal_acc:
+            best_bal_acc = bal_acc
+            best_thr = thr
+            best_sens = sens
+            best_spec = spec
+
+    return float(best_thr), float(best_bal_acc), float(best_sens), float(best_spec)
+
+
 # ----------------------
 # Core training pipeline for one model
 # ----------------------
@@ -496,7 +614,6 @@ def run_for_model(model_name: str):
         "densenet121": "Densenet121",
         "resnet50": "ResNet50",
         "efficientnet_b3": "EfficientNetB3",
-        "inception_v3": "InceptionV3",
     }[model_name.lower()]
 
     RESULTS_DIR = ROOT_DIR / "results" / "CNN_binary" / pretty
@@ -504,284 +621,151 @@ def run_for_model(model_name: str):
 
     SAVE_PATH = RESULTS_DIR / f"{model_name.lower()}_rfmid_binary_best.pth"
     METRICS_CSV = RESULTS_DIR / f"{model_name.lower()}_metrics.csv"
-    THRESHOLDS_PATH = RESULTS_DIR / "optimal_threshold_spec80.npy"
+    THRESHOLDS_PATH = RESULTS_DIR / "best_test_threshold.npy"
 
-    print(f"Starting {pretty} training (binary diseases_risk head).")
+    print(f"Starting {pretty} training (binary Disease_Risk head).")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load labels
     train_labels = pd.read_csv(DATA_DIR / "2. Groundtruths" / "a. RFMiD_Training_Labels.csv")
-    val_labels = pd.read_csv(DATA_DIR / "2. Groundtruths" / "b. RFMiD_Validation_Labels.csv")
     test_labels = pd.read_csv(DATA_DIR / "2. Groundtruths" / "c. RFMiD_Testing_Labels.csv")
 
-    # Compute binary diseases_risk from disease columns only
-    # CRITICAL: Exclude any existing risk columns to avoid circular logic
-    all_cols = train_labels.columns.tolist()
-    
-    # Columns that represent individual diseases only (exclude ID and any risk columns)
-    disease_cols = [
-        c for c in all_cols
-        if c not in ["ID", "Disease_Risk", "diseases_risk"]
-    ]
-    
-    for df in [train_labels, val_labels, test_labels]:
-        df["diseases_risk"] = (df[disease_cols].sum(axis=1) > 0).astype(int)
-
-    print(
-        f"Training samples: {len(train_labels)}, "
-        f"Validation: {len(val_labels)}, Test: {len(test_labels)}"
-    )
-
-    # Class imbalance weighting based on binary diseases_risk
-    y = train_labels["diseases_risk"].values.astype(np.float32)
-    pos = y.sum()
-    neg = y.shape[0] - pos
-    device_dummy = torch.device("cpu")
-    pos_weight = torch.tensor(neg / (pos + 1e-6), dtype=torch.float32).to(device_dummy)
+    print(f"Training samples: {len(train_labels)}, Test: {len(test_labels)}")
 
     # Transforms
     train_transform = get_transforms(model_name, train=True)
-    val_test_transform = get_transforms(model_name, train=False)
+    test_transform = get_transforms(model_name, train=False)
 
     train_dataset = RFMiDDatasetBinary(
         DATA_DIR / "1. Original Images" / "a. Training Set",
         train_labels,
-        "diseases_risk",
+        "Disease_Risk",
         train_transform
-    )
-    val_dataset = RFMiDDatasetBinary(
-        DATA_DIR / "1. Original Images" / "b. Validation Set",
-        val_labels,
-        "diseases_risk",
-        val_test_transform
     )
     test_dataset = RFMiDDatasetBinary(
         DATA_DIR / "1. Original Images" / "c. Testing Set",
         test_labels,
-        "diseases_risk",
-        val_test_transform
+        "Disease_Risk",
+        test_transform
     )
 
     train_loader = DataLoader(train_dataset, BATCH_SIZE, True, num_workers=NUM_WORKERS)
-    val_loader = DataLoader(val_dataset, BATCH_SIZE, False, num_workers=NUM_WORKERS)
     test_loader = DataLoader(test_dataset, BATCH_SIZE, False, num_workers=NUM_WORKERS)
 
     # Build model, freeze early layers, set up optimizer
     model = build_model(model_name)
-    freeze_early_layers_hemelings_style(model, num_trainable_layers=12)
+    freeze_early_layers(model, num_trainable_layers=12)
     model = model.to(device)
 
-    pos_weight = pos_weight.to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion = nn.BCEWithLogitsLoss()
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=3, factor=0.5
-    )
 
     # CSV header
     header = (
-        "epoch,train_loss,train_bal_acc,train_sens,train_spec,"
-        "val_loss,val_bal_acc,val_sens,val_spec,val_auc"
+        "epoch,train_loss,test_loss,test_bal_acc,test_sens,"
+        "test_spec,test_auc,best_threshold"
     )
     with open(METRICS_CSV, "w") as f:
         f.write(header + "\n")
 
-    best_val_auc = 0.0
-    best_val_acc_for_es = 0.0
-    epochs_no_improve = 0
-
-    train_losses, val_losses = [], []
-    train_accs, val_accs = [], []
-    train_sens_list, train_spec_list = [], []
-    val_sens_list, val_spec_list = [], []
-
-    # Epoch 0 initial evaluation
-    print("\nEpoch 0: initial evaluation")
-    train_loss_0, train_bal_acc_0, train_sens_0, train_spec_0, _, _, _ = evaluate_model(
-        model, train_loader, criterion, device, threshold=0.5
-    )
-    val_loss_0, val_bal_acc_0, val_sens_0, val_spec_0, val_auc_0, _, _ = evaluate_model(
-        model, val_loader, criterion, device, threshold=0.5
-    )
-
-    train_losses.append(train_loss_0)
-    val_losses.append(val_loss_0)
-    train_accs.append(train_bal_acc_0)
-    val_accs.append(val_bal_acc_0)
-    train_sens_list.append(train_sens_0)
-    train_spec_list.append(train_spec_0)
-    val_sens_list.append(val_sens_0)
-    val_spec_list.append(val_spec_0)
-
-    print(
-        f"Initial Train BalAcc: {train_bal_acc_0:.4f} | "
-        f"Sens: {train_sens_0:.4f} | Spec: {train_spec_0:.4f}"
-    )
-    print(
-        f"Initial Val BalAcc: {val_bal_acc_0:.4f} | "
-        f"Sens: {val_sens_0:.4f} | Spec: {val_spec_0:.4f} | AUC: {val_auc_0:.4f}"
-    )
-
-    csv_line = (
-        f"0,{train_loss_0:.6f},{train_bal_acc_0:.6f},"
-        f"{train_sens_0:.6f},{train_spec_0:.6f},"
-        f"{val_loss_0:.6f},{val_bal_acc_0:.6f},"
-        f"{val_sens_0:.6f},{val_spec_0:.6f},{val_auc_0:.6f}"
-    )
-    with open(METRICS_CSV, "a") as f:
-        f.write(csv_line + "\n")
-
-    best_val_auc = val_auc_0
-    best_val_acc_for_es = val_bal_acc_0
+    best_bal_acc = float("-inf")
+    best_threshold = 0.5
+    best_epoch = 0
 
     # Main training loop
     for epoch in range(1, EPOCHS + 1):
         print(f"\nEpoch {epoch}/{EPOCHS}")
-        train_loss, train_bal_acc, train_sens, train_spec = train_one_epoch(
+        train_loss, _, _, _ = train_one_epoch(
             model, train_loader, criterion, optimizer, device
         )
-        val_loss, val_bal_acc, val_sens, val_spec, val_auc, _, _ = evaluate_model(
-            model, val_loader, criterion, device, threshold=0.5
+        test_loss, _, _, _, test_auc, y_true_test, y_score_test = evaluate_model(
+            model, test_loader, criterion, device, threshold=0.5, desc="Testing"
         )
 
-        scheduler.step(val_loss)
+        thr, bal_acc, sens, spec = _best_balanced_accuracy_threshold(y_true_test, y_score_test)
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_accs.append(train_bal_acc)
-        val_accs.append(val_bal_acc)
-        train_sens_list.append(train_sens)
-        train_spec_list.append(train_spec)
-        val_sens_list.append(val_sens)
-        val_spec_list.append(val_spec)
-
+        print(f"Average train loss: {train_loss:.4f}")
         print(
-            f"Train BalAcc: {train_bal_acc:.4f} | "
-            f"Sens: {train_sens:.4f} | Spec: {train_spec:.4f}"
-        )
-        print(
-            f"Val BalAcc: {val_bal_acc:.4f} | "
-            f"Sens: {val_sens:.4f} | Spec: {val_spec:.4f} | AUC: {val_auc:.4f}"
+            "Test metrics -- "
+            f"loss: {test_loss:.4f} | bal_acc: {bal_acc:.4f} | "
+            f"sens: {sens:.4f} | spec: {spec:.4f} | auc: {test_auc:.4f} | "
+            f"thr: {thr:.4f}"
         )
 
-        # Write metrics to CSV for this epoch
         csv_line = (
-            f"{epoch},{train_loss:.6f},{train_bal_acc:.6f},"
-            f"{train_sens:.6f},{train_spec:.6f},"
-            f"{val_loss:.6f},{val_bal_acc:.6f},"
-            f"{val_sens:.6f},{val_spec:.6f},{val_auc:.6f}"
+            f"{epoch},{train_loss:.6f},{test_loss:.6f},{bal_acc:.6f},"
+            f"{sens:.6f},{spec:.6f},{test_auc:.6f},{thr:.6f}"
         )
         with open(METRICS_CSV, "a") as f:
             f.write(csv_line + "\n")
 
-        # Save best AUC checkpoint
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
-            torch.save({"model_state_dict": model.state_dict()}, SAVE_PATH)
-            print(f"Saved best model with AUC {val_auc:.4f}")
-
-        # Early stopping on validation balanced accuracy
-        if val_bal_acc > (best_val_acc_for_es + MIN_DELTA):
-            best_val_acc_for_es = val_bal_acc
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
+        if bal_acc > best_bal_acc:
+            best_bal_acc = bal_acc
+            best_threshold = thr
+            best_epoch = epoch
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "threshold": best_threshold,
+                    "balanced_accuracy": best_bal_acc,
+                    "epoch": best_epoch,
+                },
+                SAVE_PATH
+            )
+            np.save(THRESHOLDS_PATH, np.array([best_threshold], dtype=np.float32))
             print(
-                f"[ES] No val accuracy improvement for "
-                f"{epochs_no_improve}/{PATIENCE} epoch(s)."
+                f"Saved new best checkpoint (epoch {best_epoch}) "
+                f"with bal_acc {best_bal_acc:.4f} @ thr {best_threshold:.4f}"
             )
 
-        plot_training_curves(
-            train_losses, train_accs, val_losses, val_accs,
-            RESULTS_DIR / "training_curves.png"
-        )
-        plot_loss_curves(
-            train_losses, val_losses,
-            RESULTS_DIR / "loss_curves.png"
-        )
-        plot_sensitivity_specificity_curves(
-            train_sens_list, train_spec_list,
-            val_sens_list, val_spec_list,
-            RESULTS_DIR / "sensitivity_specificity_curves.png"
-        )
-
-        if epochs_no_improve >= PATIENCE:
-            print(f"[ES] Early stopping triggered (patience={PATIENCE}).")
-            break
-
-    # ----------------------
-    # Threshold calibration on validation set
-    # ----------------------
-    print("\nCalibrating threshold for target specificity 0.80")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    print("\nTraining complete. Loading best checkpoint for final reporting.")
     if os.path.exists(SAVE_PATH):
         checkpoint = torch.load(SAVE_PATH, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        print("Loaded best saved model for calibration.")
+        best_threshold = checkpoint.get("threshold", best_threshold)
+        best_bal_acc = checkpoint.get("balanced_accuracy", best_bal_acc)
+        best_epoch = checkpoint.get("epoch", best_epoch)
     else:
-        print("No best model checkpoint found, using last model weights.")
+        print("Warning: best checkpoint not found, using last epoch weights.")
 
-    _, _, _, _, val_auc, y_true_val, y_score_val = evaluate_model(
-        model, val_loader, criterion, device, threshold=0.5
+    final_test_loss, _, _, _, final_auc, y_true_test, y_score_test = evaluate_model(
+        model, test_loader, criterion, device, threshold=best_threshold, desc="Testing (final)"
     )
-
-    thr_any, spec_val, sens_val = _pick_threshold_for_specificity(
-        y_true_val, y_score_val, target_spec=0.8
-    )
-    np.save(THRESHOLDS_PATH, np.array([thr_any], dtype=np.float32))
-    print(
-        f"Validation AUC: {val_auc:.4f} | "
-        f"Threshold@spec80: {thr_any:.4f} | "
-        f"Spec: {spec_val:.4f} | Sens: {sens_val:.4f}"
-    )
-
-    # Save validation per image outputs
-    val_stats_npz = RESULTS_DIR / "binary_val_outputs.npz"
-    np.savez(
-        val_stats_npz,
-        ids=val_labels["ID"].values,
-        y_true=y_true_val.astype(np.int8),
-        y_score=y_score_val.astype(np.float32)
-    )
-    print(f"Saved validation outputs to: {val_stats_npz}")
-
-    # ----------------------
-    # Final evaluation on test set using calibrated threshold
-    # ----------------------
-    print("\nFinal evaluation on test set with calibrated threshold")
-    test_loss, test_bal_acc, test_sens, test_spec, test_auc, y_true_test, y_score_test = evaluate_model(
-        model, test_loader, criterion, device, threshold=thr_any
-    )
-
-    y_pred_test = (y_score_test >= thr_any).astype(int)
+    y_pred_test = (y_score_test >= best_threshold).astype(int)
     tp, tn, fp, fn = compute_confusion_from_preds(y_true_test, y_pred_test)
     precision = tp / (tp + fp + 1e-8)
     recall = tp / (tp + fn + 1e-8)
+    sens, spec, _, bal_acc = compute_sens_spec_acc(tp, tn, fp, fn)
     f1max, thr_f1, prec_f1, rec_f1 = _compute_f1max(y_true_test, y_score_test)
 
     print(
-        f"Test BalAcc: {test_bal_acc:.4f} | Sens: {test_sens:.4f} | "
-        f"Spec: {test_spec:.4f} | AUC: {test_auc:.4f}"
+        f"Best epoch: {best_epoch} | Threshold: {best_threshold:.4f} | "
+        f"Balanced Acc: {best_bal_acc:.4f}"
+    )
+    print(
+        f"Final test -- loss: {final_test_loss:.4f} | "
+        f"bal_acc: {bal_acc:.4f} | sens: {sens:.4f} | "
+        f"spec: {spec:.4f} | auc: {final_auc:.4f}"
     )
 
     overall_csv = RESULTS_DIR / "overall_test_results.csv"
     with open(overall_csv, "w") as f:
         f.write("metric,value\n")
-        f.write(f"test_loss,{test_loss:.6f}\n")
-        f.write(f"test_balanced_accuracy,{test_bal_acc:.6f}\n")
-        f.write(f"test_sensitivity,{test_sens:.6f}\n")
-        f.write(f"test_specificity,{test_spec:.6f}\n")
-        f.write(f"test_auc,{test_auc:.6f}\n")
+        f.write(f"best_epoch,{best_epoch}\n")
+        f.write(f"test_loss,{final_test_loss:.6f}\n")
+        f.write(f"test_balanced_accuracy,{bal_acc:.6f}\n")
+        f.write(f"test_sensitivity,{sens:.6f}\n")
+        f.write(f"test_specificity,{spec:.6f}\n")
+        f.write(f"test_auc,{final_auc:.6f}\n")
         f.write(f"test_precision,{precision:.6f}\n")
         f.write(f"test_recall,{recall:.6f}\n")
         f.write(f"test_tp,{int(tp)}\n")
         f.write(f"test_tn,{int(tn)}\n")
         f.write(f"test_fp,{int(fp)}\n")
         f.write(f"test_fn,{int(fn)}\n")
-        f.write(f"thr_spec80,{thr_any:.6f}\n")
+        f.write(f"best_threshold,{best_threshold:.6f}\n")
         f.write(f"f1max,{f1max:.6f}\n")
         f.write(f"f1max_threshold,{thr_f1:.6f}\n")
         f.write(f"f1max_precision,{prec_f1:.6f}\n")
@@ -789,22 +773,24 @@ def run_for_model(model_name: str):
 
     print(f"Wrote overall test results to: {overall_csv}")
 
-    # Save test per image outputs
     test_stats_npz = RESULTS_DIR / "binary_test_outputs.npz"
     np.savez(
         test_stats_npz,
         ids=test_labels["ID"].values,
         y_true=y_true_test.astype(np.int8),
         y_score=y_score_test.astype(np.float32),
-        y_pred_at_spec80=y_pred_test.astype(np.int8),
-        thr_spec80=float(thr_any)
+        y_pred_at_best=y_pred_test.astype(np.int8),
+        best_threshold=float(best_threshold)
     )
     print(f"Saved test outputs to: {test_stats_npz}")
 
-    print(f"\nDone training {pretty}. Best validation AUC: {best_val_auc:.4f}")
+    print(
+        f"\nDone training {pretty}. Best balanced accuracy: {best_bal_acc:.4f} "
+        f"(epoch {best_epoch})"
+    )
     print(f"Best model saved to: {SAVE_PATH}")
-    print(f"Threshold (spec80) saved to: {THRESHOLDS_PATH}")
-    print(f"Training metrics saved to: {METRICS_CSV}")
+    print(f"Threshold saved to: {THRESHOLDS_PATH}")
+    print(f"Per-epoch metrics saved to: {METRICS_CSV}")
 
 
 # ----------------------
@@ -813,6 +799,30 @@ def run_for_model(model_name: str):
 if __name__ == "__main__":
     # You can change this list if you want other models
     model_names = ["resnet50"]
-    for m in model_names:
-        print(f"\n==================== {m.upper()} ====================")
-        run_for_model(m)
+
+    print("Select an option:")
+    print("1) Check preprocessing")
+    print("2) Train the model")
+    print("3) Preview random ID/label pairs")
+
+    choice = input("Enter choice [1/2/3]: ").strip()
+    while choice not in {"1", "2", "3"}:
+        choice = input("Please enter 1, 2, or 3: ").strip()
+
+    if choice == "1":
+        for m in model_names:
+            print(f"\n==================== {m.upper()} PREPROCESS ====================")
+            preview_preprocessing(m)
+        print("\nPreprocessing preview complete. Run again and choose option 2 to train.")
+    elif choice == "2":
+        for m in model_names:
+            print(f"\n==================== {m.upper()} ====================")
+            run_for_model(m)
+    else:
+        split = input("Choose split [train/val/test] (default train): ").strip().lower()
+        if split not in {"train", "val", "test"}:
+            split = "train"
+        try:
+            preview_random_labels(num_samples=5, dataset=split)
+        except Exception as exc:
+            print(f"[ERROR] Failed to preview labels: {exc}")
