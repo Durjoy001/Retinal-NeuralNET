@@ -304,22 +304,22 @@ class CNNAdapter(ModelAdapter):
 
     def transforms(self, is_train: bool):
         """
-        Use Hemelings-style preprocessing to match train_cnn_final.py:
-        1) Center crop to 1016 x 1016
-        2) Resize to 224 x 224
-        3) Gaussian background subtraction
-        4) ToTensor + ImageNet normalization
+        Use pretrained weights transforms to match train_cnn.py:
+        - Uses ImageNet pretrained weights transforms (standard ImageNet preprocessing)
+        - For training: adds RandomHorizontalFlip(0.5)
+        - For eval: uses base transforms only
         """
-        return transforms.Compose([
-            transforms.CenterCrop(1016),
-            transforms.Resize((224, 224)),
-            BackgroundSubtraction(kernel_size=31),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
+        W = {
+            "densenet121": DenseNet121_Weights.IMAGENET1K_V1,
+            "resnet50": ResNet50_Weights.IMAGENET1K_V1,
+            "efficientnet_b3": EfficientNet_B3_Weights.IMAGENET1K_V1,
+            "inception_v3": Inception_V3_Weights.IMAGENET1K_V1,
+        }[self.model_name]
+        base = W.transforms(antialias=True)
+        if is_train:
+            # Light extra augmentation on top of the pretrained recipe
+            return transforms.Compose([base, transforms.RandomHorizontalFlip(0.5)])
+        return base
 
 class CLIPAdapter(ModelAdapter):
     """Adapter for CLIP models (requires open_clip)."""
@@ -494,8 +494,8 @@ REGISTRY = {
     "crossvit_small": lambda nc: TimmBackboneWithHead("crossvit_15_240", nc),
     
     # Hybrids (timm)
-    "coatnet0": lambda nc: TimmBackboneWithHead("coatnet_0_rw_224", nc),
-    "maxvit_tiny": lambda nc: TimmBackboneWithHead("maxvit_tiny_rw_224", nc, fallback_names=["maxvit_tiny_tf_224"]),  # try rw first, fallback to tf
+    "coatnet0": lambda nc: TimmBackboneWithHead("coatnet_0_rw_224.sw_in1k", nc),  # Match train_hybrid.py
+    "maxvit_tiny": lambda nc: TimmBackboneWithHead("maxvit_tiny_tf_224", nc),  # Match train_hybrid.py
 }
 
 # Note: CLIP and SigLIP need class_names, so they're registered differently in main()
@@ -825,14 +825,14 @@ def main():
 
     # Use adapter's transforms for all models to match training pipeline
     # This ensures preprocessing is aligned with training code:
-    # - CNNs: Hemelings-style preprocessing (matches train_cnn_final.py)
+    # - CNNs: Pretrained weights transforms (matches train_cnn.py)
     # - ViT/Hybrid: timm transforms (matches train_vit.py / train_hybrid.py)
     # - CLIP/SigLIP: VLM-specific transforms (matches train_vlm.py)
     if model_name_lower in ["densenet121", "resnet50", "efficientnet_b3", "inception_v3"]:
-        # CNN models: use Hemelings-style preprocessing (matches train_cnn_final.py)
+        # CNN models: use pretrained weights transforms (matches train_cnn.py)
         tfm = adapter.transforms(is_train=False)
-        print(f"✅ Using Hemelings-style preprocessing for CNN model (matches training):")
-        print(f"   Center crop 1016 → Resize 224 → Background subtraction → Normalize")
+        print(f"✅ Using pretrained weights transforms for CNN model (matches train_cnn.py):")
+        print(f"   ImageNet standard preprocessing from pretrained weights")
     else:
         # ViT, Hybrid, VLM models: use training-aligned transforms from adapter
         tfm = adapter.transforms(is_train=False)
