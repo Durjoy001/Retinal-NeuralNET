@@ -75,12 +75,6 @@ def main():
                     help="Only evaluate these models (e.g., --only_models resnet50 vit_small)")
     ap.add_argument("--batch_size", type=int, default=16,
                     help="Batch size for inference")
-    ap.add_argument("--use_tta", action="store_true", default=True,
-                    help="Use test-time augmentation (default: True)")
-    ap.add_argument("--no_tta", action="store_false", dest="use_tta",
-                    help="Disable test-time augmentation (faster evaluation)")
-    ap.add_argument("--tta_num_augments", type=int, default=5,
-                    help="Number of TTA augmentations (default: 5)")
     ap.add_argument("--use_temperature_scaling", action="store_true",
                     help="Apply temperature scaling calibration on validation split")
     ap.add_argument("--temp_scaling_subset", type=int, default=500,
@@ -173,10 +167,6 @@ def main():
             "--results_dir", str(results_dir),
             "--batch_size", str(args.batch_size),
         ]
-        
-        if args.use_tta:
-            cmd.append("--use_tta")
-            cmd.extend(["--tta_num_augments", str(args.tta_num_augments)])
         
         if args.use_temperature_scaling:
             cmd.append("--use_temperature_scaling")

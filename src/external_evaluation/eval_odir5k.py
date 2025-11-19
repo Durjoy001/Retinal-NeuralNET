@@ -432,10 +432,10 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
             outputs = model(xb)
             
             # Handle tuple output (take first element if tuple)
-            if isinstance(outputs, tuple):
+                if isinstance(outputs, tuple):
                 multilabel_logits = outputs[0]
-            else:
-                multilabel_logits = outputs
+                else:
+                    multilabel_logits = outputs
             if hasattr(multilabel_logits, "logits"):
                 multilabel_logits = multilabel_logits.logits
             elif isinstance(multilabel_logits, (tuple, list)):
@@ -443,13 +443,13 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
             
             all_logits.append(multilabel_logits.cpu())
             y_true_list.append(yb.numpy())
-            
-            # Progress indicator
-            if batch_idx % 10 == 0 or batch_idx == total_batches:
+                
+                # Progress indicator
+                if batch_idx % 10 == 0 or batch_idx == total_batches:
                 processed = batch_idx * batch_size
                 actual_processed = min(processed, len(test_loader.dataset))
-                print(f"    Processed {batch_idx}/{total_batches} batches (~{actual_processed} images)...", flush=True)
-    
+                    print(f"    Processed {batch_idx}/{total_batches} batches (~{actual_processed} images)...", flush=True)
+        
     all_logits = torch.cat(all_logits, dim=0)
     all_probs = torch.sigmoid(all_logits).numpy()
     y_t = np.concatenate(y_true_list)
@@ -524,8 +524,8 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
         "F1max_Threshold": float(thr_f1) if not single_class else float("nan"),
         "F1max_Precision": float(prec_f1) if not single_class else float("nan"),
         "F1max_Recall": float(rec_f1) if not single_class else float("nan"),
-    }
-    
+        }
+
     # Threshold-based metrics only computed if not single class
     if not single_class:
         print(f"\n  Computing metrics at different thresholds...")
@@ -543,9 +543,9 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
         # Always use RFMiD threshold (standard approach)
         print(f"    RFMiD_thr: threshold={tau_dr:.6f} (fixed from RFMiD validation)")
         rfmid_metrics = eval_at_thr("RFMiD_thr", tau_dr)
-        results.update(rfmid_metrics)
+            results.update(rfmid_metrics)
         print(f"    RFMiD_thr: sens={rfmid_metrics['RFMiD_thr_Sensitivity']:.3f}, "
-              f"spec={rfmid_metrics['RFMiD_thr_Specificity']:.3f}, acc={rfmid_metrics['RFMiD_thr_Accuracy']:.3f}")
+                  f"spec={rfmid_metrics['RFMiD_thr_Specificity']:.3f}, acc={rfmid_metrics['RFMiD_thr_Accuracy']:.3f}")
 
     # Add patient-level metrics to results
     results.update(patient_metrics)

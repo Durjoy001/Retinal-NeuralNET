@@ -647,9 +647,6 @@ def main():
     ap.add_argument("--results_dir", required=True, help="Output directory for metrics")
     ap.add_argument("--val_split", type=float, default=0.2, help="Fraction of Messidor-2 data to use for validation (for temperature scaling/BN adaptation only). Default: 0.2")
     ap.add_argument("--eval_img_size", type=int, default=448, help="Input image size for evaluation (default: 448, larger than training)")
-    ap.add_argument("--use_tta", action="store_true", default=False, help="Use test-time augmentation (average original + horizontal flip). Default: False")
-    ap.add_argument("--no_tta", action="store_false", dest="use_tta", help="Disable test-time augmentation (faster evaluation)")
-    ap.add_argument("--tta_num_augments", type=int, default=5, help="Number of TTA augmentations (default: 5, includes flip, rotations, scales)")
     ap.add_argument("--disable_clahe", action="store_true", help="Disable CLAHE preprocessing (use standard transforms)")
     ap.add_argument("--use_temperature_scaling", action="store_true", help="Apply temperature scaling calibration on validation split")
     ap.add_argument("--adapt_bn", action="store_true", help="Adapt BatchNorm statistics on Messidor-2 (no labels needed)")
@@ -876,82 +873,33 @@ def main():
         model.eval()
         print("✅ BN statistics adapted")
 
-    # Inference with TTA (test-time augmentation: average original + horizontal flip)
+    # Inference with temperature scaling
     use_amp = torch.cuda.is_available() or (torch.backends.mps.is_available() if hasattr(torch.backends, "mps") else False)
     dev_type = "cuda" if torch.cuda.is_available() else ("mps" if use_amp and hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
     
-    def get_tta_transforms(xb):
-        """Generate gentle TTA transforms: small rotations (±5°) and horizontal flip."""
-        from torchvision.transforms.functional import rotate
-        transforms_list = []
-        
-        angles = [0, 5, -5]  # Small rotations only (±5°)
-        flips = [False, True]  # Original and horizontal flip
-        
-        for angle in angles:
-            if angle == 0:
-                xa = xb
-            else:
-                # Rotate entire batch (more efficient)
-                xa = rotate(xb, angle, interpolation=InterpolationMode.BILINEAR)
-            
-            for do_flip in flips:
-                if do_flip:
-                    xf = torch.flip(xa, dims=[-1])
-                else:
-                    xf = xa
-                transforms_list.append(xf)
-                
-                if len(transforms_list) >= args.tta_num_augments:
-                    break
-            if len(transforms_list) >= args.tta_num_augments:
-                break
-        
-        return transforms_list[:args.tta_num_augments]
-    
     def run_inference(dataloader, dataset_name="test", temperature=1.0):
-        """Run inference with optional TTA and temperature scaling."""
+        """Run inference with optional temperature scaling."""
         all_logits = []
         all_ids = []
         total_batches = len(dataloader)
         print(f"Running inference on {len(dataloader.dataset)} {dataset_name} images ({total_batches} batches)...")
-        if args.use_tta:
-            print(f"  Using TTA: {args.tta_num_augments} augmentations (flip, rotations, scales)")
         if temperature != 1.0:
             print(f"  Using temperature scaling: T={temperature:.3f}")
         
         with torch.inference_mode(), torch.autocast(device_type=dev_type, enabled=(dev_type != "cpu")):
             for batch_idx, (xb, ids) in enumerate(dataloader, 1):
                 xb = xb.to(device)
+                outputs = model(xb)
                 
-                # TTA: average over multiple transforms
-                if args.use_tta:
-                    tta_transforms = get_tta_transforms(xb)
-                    logits_list = []
-                    for xb_aug in tta_transforms:
-                        outputs = model(xb_aug)
-                        # Handle tuple output (take first element if tuple)
-                        if isinstance(outputs, tuple):
-                            multilabel_logits = outputs[0]
-                        else:
-                            multilabel_logits = outputs
-                        if hasattr(multilabel_logits, "logits"):
-                            multilabel_logits = multilabel_logits.logits
-                        elif isinstance(multilabel_logits, (tuple, list)):
-                            multilabel_logits = multilabel_logits[0]
-                        logits_list.append(multilabel_logits)
-                    logits_avg = torch.stack(logits_list).mean(dim=0)
+                # Handle tuple output (take first element if tuple)
+                if isinstance(outputs, tuple):
+                    logits_avg = outputs[0]
                 else:
-                    outputs = model(xb)
-                    # Handle tuple output (take first element if tuple)
-                    if isinstance(outputs, tuple):
-                        logits_avg = outputs[0]
-                    else:
-                        logits_avg = outputs
-                    if hasattr(logits_avg, "logits"):
-                        logits_avg = logits_avg.logits
-                    elif isinstance(logits_avg, (tuple, list)):
-                        logits_avg = logits_avg[0]
+                    logits_avg = outputs
+                if hasattr(logits_avg, "logits"):
+                    logits_avg = logits_avg.logits
+                elif isinstance(logits_avg, (tuple, list)):
+                    logits_avg = logits_avg[0]
                 
                 # Apply temperature scaling
                 logits_scaled = logits_avg / temperature
@@ -970,11 +918,9 @@ def main():
     
     # Step 2: Temperature scaling (fit on validation split, apply to test)
     # True one-parameter temperature scaling: minimize NLL w.r.t. T
-    # NOTE: Skip TTA during temperature scaling for speed (TTA not needed for calibration)
     temperature = 1.0
     if args.use_temperature_scaling and use_val_split:
         print("\n📊 Fitting temperature scaling on validation split...")
-        print("  ⚡ Skipping TTA for speed (not needed for calibration)")
         # Get raw logits (without temperature scaling) for fitting
         # Optionally use subset for faster calibration
         subset_indices = None
@@ -997,7 +943,6 @@ def main():
         with torch.inference_mode(), torch.autocast(device_type=dev_type, enabled=(dev_type != "cpu")):
             for batch_idx, (xb, _) in enumerate(dl_train_for_temp, 1):
                 xb = xb.to(device)
-                # Skip TTA for temperature scaling - just need raw logits for calibration
                 outputs = model(xb)
                 # Handle tuple output (take first element if tuple)
                 if isinstance(outputs, tuple):
