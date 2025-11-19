@@ -2,8 +2,12 @@
 """
 Batch evaluation script: Evaluate all trained models on Messidor-2 dataset.
 
-This script runs eval_external_messidor2_generic.py for all available models
+This script runs eval_messidor2.py for all available models
 (CNN, ViT, Hybrid, VLM) in a single execution.
+
+All models use:
+- DR head from multilabel classifier
+- Fixed RFMiD validation threshold (no threshold adaptation)
 
 Usage:
     python -m src.external_evaluation.eval_all_models_messidor2 \
@@ -71,28 +75,20 @@ def main():
                     help="Only evaluate these models (e.g., --only_models resnet50 vit_small)")
     ap.add_argument("--batch_size", type=int, default=16,
                     help="Batch size for inference")
-    ap.add_argument("--any_thr", type=float, default=None,
-                    help="Override any-abnormal threshold for all models")
-    ap.add_argument("--use_f1max_threshold", action="store_true",
-                    help="Use F1max threshold instead of RFMiD threshold (better for domain shift)")
-    ap.add_argument("--target_specificity", type=float, default=None,
-                    help="Use threshold that achieves target specificity (e.g., 0.8 for 80%% specificity). Overrides --use_f1max_threshold if set.")
-    ap.add_argument("--threshold_method", type=str, default="youden", choices=["youden", "f1max", "sensitivity", "specificity"],
-                    help="Method for threshold selection on validation split: 'youden' (max J, default), 'f1max' (max F1), 'sensitivity' (target TPR), 'specificity' (target TNR)")
     ap.add_argument("--use_tta", action="store_true", default=True,
                     help="Use test-time augmentation (default: True)")
-    ap.add_argument("--tta_num_augments", type=int, default=6,
-                    help="Number of TTA augmentations (default: 6)")
+    ap.add_argument("--no_tta", action="store_false", dest="use_tta",
+                    help="Disable test-time augmentation (faster evaluation)")
+    ap.add_argument("--tta_num_augments", type=int, default=5,
+                    help="Number of TTA augmentations (default: 5)")
     ap.add_argument("--use_temperature_scaling", action="store_true",
                     help="Apply temperature scaling calibration on validation split")
     ap.add_argument("--temp_scaling_subset", type=int, default=500,
                     help="Use subset of training data for temperature scaling (faster, default: 500)")
     ap.add_argument("--adapt_bn", action="store_true",
                     help="Adapt BatchNorm statistics on Messidor-2 (no labels needed)")
-    ap.add_argument("--eval_img_size", type=int, default=448,
-                    help="Input image size for evaluation (default: 448)")
     ap.add_argument("--disable_clahe", action="store_true",
-                    help="Disable CLAHE preprocessing")
+                    help="Disable CLAHE preprocessing (not used - models use training-aligned transforms)")
     ap.add_argument("--no_referable_dr", action="store_true",
                     help="Disable referable DR metrics for all models")
     args = ap.parse_args()
@@ -167,7 +163,7 @@ def main():
         
         # Build command
         cmd = [
-            sys.executable, "-m", "src.external_evaluation.eval_external_messidor2_generic",
+            sys.executable, "-m", "src.external_evaluation.eval_messidor2",
             "--model_name", model_name,
             "--checkpoint", str(full_ckpt),
             "--thresholds", str(full_thr),
@@ -177,17 +173,6 @@ def main():
             "--results_dir", str(results_dir),
             "--batch_size", str(args.batch_size),
         ]
-        
-        if args.any_thr is not None:
-            cmd.extend(["--any_thr", str(args.any_thr)])
-        
-        if args.target_specificity is not None:
-            cmd.extend(["--target_specificity", str(args.target_specificity)])
-        elif args.use_f1max_threshold:
-            cmd.append("--use_f1max_threshold")
-        else:
-            # Default to Youden's J threshold method
-            cmd.extend(["--threshold_method", args.threshold_method])
         
         if args.use_tta:
             cmd.append("--use_tta")
@@ -200,8 +185,6 @@ def main():
         
         if args.adapt_bn:
             cmd.append("--adapt_bn")
-        
-        cmd.extend(["--eval_img_size", str(args.eval_img_size)])
         
         if args.disable_clahe:
             cmd.append("--disable_clahe")
