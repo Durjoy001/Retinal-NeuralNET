@@ -1,7 +1,67 @@
-Model1,Model2,Acc_Diff,b,c,Chi2_Stat,P_Value,Significant
-Densenet121,EfficientNetB3,0.03749999999999998,68,44,5.142857142857143,0.023342202012890834,True
-Densenet121,InceptionV3,0.014062499999999978,61,52,0.7168141592920354,0.39719091509494653,False
-Densenet121,ResNet50,-0.09062499999999996,17,75,36.56521739130435,1.4764284239632275e-09,True
-EfficientNetB3,InceptionV3,-0.0234375,59,74,1.6917293233082706,0.1933731631050034,False
-EfficientNetB3,ResNet50,-0.12812499999999993,24,106,51.723076923076924,6.390443729742401e-13,True
-InceptionV3,ResNet50,-0.10468749999999993,26,93,37.72268907563025,8.155048858426994e-10,True
+Model1,Model2,Threshold1,Threshold2,b,c,Statistic,P_Value,Method,Significant
+CLIPViTB16,CoAtNet0,0.562807,0.672824,42,33,0.8533333333333334,0.35561106109523904,chi-square McNemar with continuity correction,No
+CLIPViTB16,CrossViTSmall,0.562807,0.659295,36,22,2.913793103448276,0.087825095630195,chi-square McNemar with continuity correction,No
+CLIPViTB16,DeiTSmall,0.562807,0.715056,23,40,4.063492063492063,0.04381979280267483,chi-square McNemar with continuity correction,Yes
+CLIPViTB16,Densenet121,0.562807,0.677525,47,55,0.4803921568627451,0.48824473936693236,chi-square McNemar with continuity correction,No
+CLIPViTB16,EfficientNetB3,0.562807,0.551735,0,110,108.00909090909092,2.6754817216445076e-25,chi-square McNemar with continuity correction,Yes
+CLIPViTB16,InceptionV3,0.562807,0.526641,14,98,61.50892857142857,4.407400026325247e-15,chi-square McNemar with continuity correction,Yes
+CLIPViTB16,MaxViTTiny,0.562807,0.711696,48,22,8.928571428571429,0.0028074384620020197,chi-square McNemar with continuity correction,Yes
+CLIPViTB16,ResNet50,0.562807,0.575756,43,29,2.3472222222222223,0.12550647143746912,chi-square McNemar with continuity correction,No
+CLIPViTB16,SigLIPBase384,0.562807,0.651688,41,35,0.32894736842105265,0.5662795740453292,chi-square McNemar with continuity correction,No
+CLIPViTB16,SwinTiny,0.562807,0.895792,48,25,6.63013698630137,0.010026755317172918,chi-square McNemar with continuity correction,Yes
+CLIPViTB16,ViTSmall,0.562807,0.590159,21,47,9.191176470588236,0.0024318453627428568,chi-square McNemar with continuity correction,Yes
+CoAtNet0,CrossViTSmall,0.672824,0.659295,28,23,0.3137254901960784,0.5754030229127537,chi-square McNemar with continuity correction,No
+CoAtNet0,DeiTSmall,0.672824,0.715056,13,39,12.01923076923077,0.0005265442896483668,chi-square McNemar with continuity correction,Yes
+CoAtNet0,Densenet121,0.672824,0.677525,40,57,2.6391752577319587,0.10425765436188247,chi-square McNemar with continuity correction,No
+CoAtNet0,EfficientNetB3,0.672824,0.551735,1,120,115.07438016528926,7.580035299974044e-27,chi-square McNemar with continuity correction,Yes
+CoAtNet0,InceptionV3,0.672824,0.526641,5,98,82.1747572815534,1.2457070038442733e-19,chi-square McNemar with continuity correction,Yes
+CoAtNet0,MaxViTTiny,0.672824,0.711696,31,14,5.688888888888889,0.0170726610937884,chi-square McNemar with continuity correction,Yes
+CoAtNet0,ResNet50,0.672824,0.575756,31,26,0.2807017543859649,0.5962416305866569,chi-square McNemar with continuity correction,No
+CoAtNet0,SigLIPBase384,0.672824,0.651688,26,29,0.07272727272727272,0.7874064906662693,chi-square McNemar with continuity correction,No
+CoAtNet0,SwinTiny,0.672824,0.895792,34,20,3.1296296296296298,0.07688120490870527,chi-square McNemar with continuity correction,No
+CoAtNet0,ViTSmall,0.672824,0.590159,10,45,21.01818181818182,4.549454738500187e-06,chi-square McNemar with continuity correction,Yes
+CrossViTSmall,DeiTSmall,0.659295,0.715056,7,38,20.0,7.744216431044098e-06,chi-square McNemar with continuity correction,Yes
+CrossViTSmall,Densenet121,0.659295,0.677525,39,61,4.41,0.03572884112563312,chi-square McNemar with continuity correction,Yes
+CrossViTSmall,EfficientNetB3,0.659295,0.551735,0,124,122.00806451612904,2.2990149861418093e-28,chi-square McNemar with continuity correction,Yes
+CrossViTSmall,InceptionV3,0.659295,0.526641,4,102,88.76415094339623,4.448041287042533e-21,chi-square McNemar with continuity correction,Yes
+CrossViTSmall,MaxViTTiny,0.659295,0.711696,36,24,2.0166666666666666,0.15558034779219795,chi-square McNemar with continuity correction,No
+CrossViTSmall,ResNet50,0.659295,0.575756,29,29,0.017241379310344827,0.8955329031670438,chi-square McNemar with continuity correction,No
+CrossViTSmall,SigLIPBase384,0.659295,0.651688,29,37,0.7424242424242424,0.388885411807765,chi-square McNemar with continuity correction,No
+CrossViTSmall,SwinTiny,0.659295,0.895792,29,20,1.3061224489795917,0.2530979089471156,chi-square McNemar with continuity correction,No
+CrossViTSmall,ViTSmall,0.659295,0.590159,6,46,29.25,6.36162264112939e-08,chi-square McNemar with continuity correction,Yes
+DeiTSmall,Densenet121,0.715056,0.677525,53,44,0.6597938144329897,0.4166327439658848,chi-square McNemar with continuity correction,No
+DeiTSmall,EfficientNetB3,0.715056,0.551735,3,96,85.4949494949495,2.3229415544240543e-20,chi-square McNemar with continuity correction,Yes
+DeiTSmall,InceptionV3,0.715056,0.526641,10,77,50.06896551724138,1.484361585104572e-12,chi-square McNemar with continuity correction,Yes
+DeiTSmall,MaxViTTiny,0.715056,0.711696,51,8,29.89830508474576,4.5531067369902674e-08,chi-square McNemar with continuity correction,Yes
+DeiTSmall,ResNet50,0.715056,0.575756,47,16,14.285714285714286,0.00015705228423075167,chi-square McNemar with continuity correction,Yes
+DeiTSmall,SigLIPBase384,0.715056,0.651688,45,22,7.223880597014926,0.00719400188568725,chi-square McNemar with continuity correction,Yes
+DeiTSmall,SwinTiny,0.715056,0.895792,46,6,29.25,6.36162264112939e-08,chi-square McNemar with continuity correction,Yes
+DeiTSmall,ViTSmall,0.715056,0.590159,20,29,1.3061224489795917,0.2530979089471156,chi-square McNemar with continuity correction,No
+Densenet121,EfficientNetB3,0.677525,0.551735,0,102,100.00980392156863,1.516445524316648e-23,chi-square McNemar with continuity correction,Yes
+Densenet121,InceptionV3,0.677525,0.526641,19,95,49.3421052631579,2.149979607619317e-12,chi-square McNemar with continuity correction,Yes
+Densenet121,MaxViTTiny,0.677525,0.711696,69,35,10.471153846153847,0.0012125296275156722,chi-square McNemar with continuity correction,Yes
+Densenet121,ResNet50,0.677525,0.575756,58,36,4.691489361702128,0.030312362447326973,chi-square McNemar with continuity correction,Yes
+Densenet121,SigLIPBase384,0.677525,0.651688,58,44,1.6568627450980393,0.1980274426061407,chi-square McNemar with continuity correction,No
+Densenet121,SwinTiny,0.677525,0.895792,68,37,8.571428571428571,0.0034147911781178177,chi-square McNemar with continuity correction,Yes
+Densenet121,ViTSmall,0.677525,0.590159,43,61,2.7788461538461537,0.09551696030594412,chi-square McNemar with continuity correction,No
+EfficientNetB3,InceptionV3,0.551735,0.526641,33,7,15.625,7.722679550543417e-05,chi-square McNemar with continuity correction,Yes
+EfficientNetB3,MaxViTTiny,0.551735,0.711696,137,1,132.06521739130434,1.4478374721938316e-30,chi-square McNemar with continuity correction,Yes
+EfficientNetB3,ResNet50,0.551735,0.575756,124,0,122.00806451612904,2.2990149861418093e-28,chi-square McNemar with continuity correction,Yes
+EfficientNetB3,SigLIPBase384,0.551735,0.651688,118,2,110.20833333333333,8.821497035746955e-26,chi-square McNemar with continuity correction,Yes
+EfficientNetB3,SwinTiny,0.551735,0.895792,134,1,129.06666666666666,6.557833396293634e-30,chi-square McNemar with continuity correction,Yes
+EfficientNetB3,ViTSmall,0.551735,0.590159,87,3,76.54444444444445,2.1531233523573425e-18,chi-square McNemar with continuity correction,Yes
+InceptionV3,MaxViTTiny,0.526641,0.711696,114,4,100.6864406779661,1.0776075592228764e-23,chi-square McNemar with continuity correction,Yes
+InceptionV3,ResNet50,0.526641,0.575756,102,4,88.76415094339623,4.448041287042533e-21,chi-square McNemar with continuity correction,Yes
+InceptionV3,SigLIPBase384,0.526641,0.651688,96,6,77.65686274509804,1.225896257126037e-18,chi-square McNemar with continuity correction,Yes
+InceptionV3,SwinTiny,0.526641,0.895792,112,5,96.03418803418803,1.1291664301055307e-22,chi-square McNemar with continuity correction,Yes
+InceptionV3,ViTSmall,0.526641,0.590159,69,11,40.6125,1.8561545149280323e-10,chi-square McNemar with continuity correction,Yes
+MaxViTTiny,ResNet50,0.711696,0.575756,20,32,2.326923076923077,0.12715299260001423,chi-square McNemar with continuity correction,No
+MaxViTTiny,SigLIPBase384,0.711696,0.651688,15,35,7.22,0.007209570764742534,chi-square McNemar with continuity correction,Yes
+MaxViTTiny,SwinTiny,0.711696,0.895792,20,23,0.09302325581395349,0.7603683300552028,chi-square McNemar with continuity correction,No
+MaxViTTiny,ViTSmall,0.711696,0.590159,9,61,37.15714285714286,1.0898281454831209e-09,chi-square McNemar with continuity correction,Yes
+ResNet50,SigLIPBase384,0.575756,0.651688,23,31,0.9074074074074074,0.34080324688608465,chi-square McNemar with continuity correction,No
+ResNet50,SwinTiny,0.575756,0.895792,33,24,1.1228070175438596,0.28931483238198774,chi-square McNemar with continuity correction,No
+ResNet50,ViTSmall,0.575756,0.590159,13,53,23.045454545454547,1.5821612264187598e-06,chi-square McNemar with continuity correction,Yes
+SigLIPBase384,SwinTiny,0.651688,0.895792,34,17,5.019607843137255,0.025061844343883633,chi-square McNemar with continuity correction,Yes
+SigLIPBase384,ViTSmall,0.651688,0.590159,10,42,18.48076923076923,1.716273563594277e-05,chi-square McNemar with continuity correction,Yes
+SwinTiny,ViTSmall,0.895792,0.590159,4,53,40.421052631578945,2.0472322655497086e-10,chi-square McNemar with continuity correction,Yes
