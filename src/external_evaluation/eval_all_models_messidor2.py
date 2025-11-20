@@ -75,12 +75,6 @@ def main():
                     help="Only evaluate these models (e.g., --only_models resnet50 vit_small)")
     ap.add_argument("--batch_size", type=int, default=16,
                     help="Batch size for inference")
-    ap.add_argument("--use_temperature_scaling", action="store_true",
-                    help="Apply temperature scaling calibration on validation split")
-    ap.add_argument("--temp_scaling_subset", type=int, default=500,
-                    help="Use subset of training data for temperature scaling (faster, default: 500)")
-    ap.add_argument("--adapt_bn", action="store_true",
-                    help="Adapt BatchNorm statistics on Messidor-2 (no labels needed)")
     ap.add_argument("--disable_clahe", action="store_true",
                     help="Disable CLAHE preprocessing (not used - models use training-aligned transforms)")
     ap.add_argument("--no_referable_dr", action="store_true",
@@ -167,14 +161,6 @@ def main():
             "--results_dir", str(results_dir),
             "--batch_size", str(args.batch_size),
         ]
-        
-        if args.use_temperature_scaling:
-            cmd.append("--use_temperature_scaling")
-            if args.temp_scaling_subset:
-                cmd.extend(["--temp_scaling_subset", str(args.temp_scaling_subset)])
-        
-        if args.adapt_bn:
-            cmd.append("--adapt_bn")
         
         if args.disable_clahe:
             cmd.append("--disable_clahe")

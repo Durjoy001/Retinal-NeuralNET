@@ -286,7 +286,9 @@ class CNNAdapter(ModelAdapter):
                 nn.Linear(256, self.num_classes)
             )
         elif self.model_name == "inception_v3":
-            model = models.inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, aux_logits=False)
+            # weights force aux_logits=True at construction (matches train_cnn.py)
+            model = models.inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, aux_logits=True)
+            # main head
             in_f = model.fc.in_features
             model.fc = nn.Sequential(
                 nn.Dropout(0.5),
@@ -295,6 +297,10 @@ class CNNAdapter(ModelAdapter):
                 nn.Dropout(0.3),
                 nn.Linear(256, self.num_classes)
             )
+            # aux head must also match num_classes (matches train_cnn.py structure)
+            if model.AuxLogits is not None:
+                aux_in = model.AuxLogits.fc.in_features
+                model.AuxLogits.fc = nn.Linear(aux_in, self.num_classes)
         else:
             raise ValueError(f"Unknown CNN model: {self.model_name}")
         
@@ -645,12 +651,8 @@ def main():
     ap.add_argument("--messidor_csv", required=True, help="Messidor-2 labels CSV")
     ap.add_argument("--images_dir", required=True, help="Messidor-2 images directory")
     ap.add_argument("--results_dir", required=True, help="Output directory for metrics")
-    ap.add_argument("--val_split", type=float, default=0.2, help="Fraction of Messidor-2 data to use for validation (for temperature scaling/BN adaptation only). Default: 0.2")
     ap.add_argument("--eval_img_size", type=int, default=448, help="Input image size for evaluation (default: 448, larger than training)")
     ap.add_argument("--disable_clahe", action="store_true", help="Disable CLAHE preprocessing (use standard transforms)")
-    ap.add_argument("--use_temperature_scaling", action="store_true", help="Apply temperature scaling calibration on validation split")
-    ap.add_argument("--adapt_bn", action="store_true", help="Adapt BatchNorm statistics on Messidor-2 (no labels needed)")
-    ap.add_argument("--temp_scaling_subset", type=int, default=None, help="Use subset of training data for temperature scaling (faster). Default: use all training data")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--num_workers", type=int, default=4, help="Number of DataLoader workers")
     ap.add_argument("--pin_memory", action="store_true", help="Pin memory for faster GPU transfer")
@@ -715,42 +717,10 @@ def main():
     mdf.reset_index(drop=True, inplace=True)
     print(f"Using {len(mdf)} gradable Messidor-2 images.")
 
-    # Split into train/val only for temperature scaling or BN adaptation (if requested)
-    use_val_split = (args.use_temperature_scaling or args.adapt_bn)
+    # Use all data for evaluation (no domain adaptation)
+    mdf_test = mdf
     
-    if use_val_split:
-        # Patient-level split: extract patient ID from id_code (assumes format like "patient_eye" or similar)
-        # Try to extract patient ID - common patterns: "patient_001_left", "001_left", etc.
-        def extract_patient_id(id_code):
-            """Extract patient ID from image ID code."""
-            id_str = str(id_code)
-            # Try splitting by common delimiters
-            for sep in ['_', '-', ' ']:
-                parts = id_str.split(sep)
-                if len(parts) > 1:
-                    # Usually patient ID is the first part
-                    return parts[0]
-            # Fallback: use first 6-8 characters as patient ID
-            return id_str[:8]
-        
-        mdf["patient_id"] = mdf["id_code"].apply(extract_patient_id)
-        
-        # Use GroupShuffleSplit to ensure patient-level grouping
-        from sklearn.model_selection import GroupShuffleSplit
-        gss = GroupShuffleSplit(n_splits=1, test_size=args.val_split, random_state=args.seed)
-        train_idx, test_idx = next(gss.split(mdf, groups=mdf["patient_id"], 
-                                             y=(mdf["diagnosis"].astype(int) > 0)))  # Stratify by DR presence
-        
-        mdf_train = mdf.iloc[train_idx].reset_index(drop=True)
-        mdf_test = mdf.iloc[test_idx].reset_index(drop=True)
-        
-        print(f"  Split (patient-level): {len(mdf_train)} train (for threshold/calibration), {len(mdf_test)} test (for final evaluation)")
-        print(f"  Unique patients: {mdf_train['patient_id'].nunique()} train, {mdf_test['patient_id'].nunique()} test")
-    else:
-        mdf_train = None
-        mdf_test = mdf  # Use all data for evaluation (only if no threshold adaptation)
-    
-    # Ground truths (for test set)
+    # Ground truths
     y_any_abnormal = (mdf_test["diagnosis"].astype(int) > 0).astype(np.int32).values
     y_dr = (mdf_test["diagnosis"].astype(int) > 0).astype(np.int32).values
     y_dr_referr = (mdf_test["diagnosis"].astype(int) >= 2).astype(np.int32).values if args.with_referable_dr else None
@@ -782,7 +752,50 @@ def main():
     model_keys = set(model.state_dict().keys())
     state_keys = set(state.keys())
     
-    # If keys don't match, try remapping common patterns
+    # Handle EfficientNetB3 classifier key mismatch FIRST (before other remapping)
+    if model_name_lower == "efficientnet_b3":
+        # Check if checkpoint has nested classifier keys (classifier.1.1.* instead of classifier.1.*)
+        if any(k.startswith("classifier.1.1.") for k in state_keys):
+            # Remap classifier.1.1.* -> classifier.1.* and classifier.1.4.* -> classifier.4.*
+            # This handles checkpoints saved with nested Sequential structure
+            new_state = {}
+            remapped = False
+            for k, v in state.items():
+                if k.startswith("classifier.1.1."):
+                    # Remap classifier.1.1.weight -> classifier.1.weight
+                    new_key = k.replace("classifier.1.1.", "classifier.1.")
+                    new_state[new_key] = v
+                    remapped = True
+                elif k.startswith("classifier.1.4."):
+                    # Remap classifier.1.4.weight -> classifier.4.weight
+                    new_key = k.replace("classifier.1.4.", "classifier.4.")
+                    new_state[new_key] = v
+                    remapped = True
+                else:
+                    new_state[k] = v
+            if remapped:
+                state = new_state
+                state_keys = set(state.keys())  # Update state_keys after remapping
+                print(f"  ✅ Remapped EfficientNetB3 classifier keys: classifier.1.1.* → classifier.1.*, classifier.1.4.* → classifier.4.*")
+    
+    # Handle key remapping for ViT/Hybrid models (checkpoint may use "classifier.*" but model expects "multilabel_classifier.*")
+    if model_name_lower in ["swin_tiny", "vit_small", "deit_small", "crossvit_small", "coatnet0", "maxvit_tiny"]:
+        # Remap "classifier.*" to "multilabel_classifier.*" if needed
+        # Also add "classifier.*" keys for backward compatibility (model has both attributes pointing to same object)
+        if any(k.startswith("classifier.") for k in state_keys) and not any(k.startswith("multilabel_classifier.") for k in state_keys):
+            new_state = {}
+            for k, v in state.items():
+                if k.startswith("classifier."):
+                    # Add both multilabel_classifier.* (primary) and classifier.* (backward compat)
+                    new_state[k.replace("classifier.", "multilabel_classifier.")] = v
+                    new_state[k] = v  # Keep original for backward compatibility
+                else:
+                    new_state[k] = v
+            state = new_state
+            state_keys = set(state.keys())  # Update state_keys after remapping
+            print(f"  ✅ Remapped checkpoint keys: classifier.* → multilabel_classifier.* (and kept classifier.* for backward compatibility)")
+    
+    # If keys still don't match, try remapping common patterns
     if not model_keys.intersection(state_keys):
         # For CNN models: checkpoint may have "backbone." or "m." prefix
         if model_name_lower in ["densenet121", "resnet50", "efficientnet_b3", "inception_v3"]:
@@ -802,6 +815,17 @@ def main():
     if "clip" in model_name_lower or "biomedclip" in model_name_lower or "siglip" in model_name_lower:
         # VLM adapters may not load your RFMiD heads; use the adapter weights only
         vlm_type = "CLIP" if "clip" in model_name_lower or "biomedclip" in model_name_lower else "SigLIP"
+        
+        # Handle CLIP cached_text_embeds buffer shape mismatch
+        if "clip" in model_name_lower or "biomedclip" in model_name_lower:
+            # Remove cached_text_embeds from state if shape doesn't match (will be recomputed)
+            if "cached_text_embeds" in state:
+                checkpoint_shape = state["cached_text_embeds"].shape
+                model_shape = model.cached_text_embeds.shape
+                if checkpoint_shape != model_shape:
+                    print(f"  ℹ️  Removing cached_text_embeds from checkpoint (shape mismatch: {checkpoint_shape} vs {model_shape}), will be recomputed")
+                    state = {k: v for k, v in state.items() if k != "cached_text_embeds"}
+        
         try:
             missing_keys, unexpected_keys = model.load_state_dict(state, strict=False)
             if missing_keys:
@@ -841,161 +865,45 @@ def main():
             # ViT or Hybrid models
             print(f"✅ Using timm transforms for {model_name_lower} (matches train_vit.py / train_hybrid.py)")
     
-    # Create datasets
+    # Create dataset
     ds_test = Messidor2Dataset(Path(args.images_dir), mdf_test, tfm)
     dl_test = DataLoader(ds_test, batch_size=args.batch_size, shuffle=False,
                          num_workers=args.num_workers, pin_memory=args.pin_memory)
     
-    # Create train dataset if needed for threshold selection, BN adaptation, or temperature scaling
-    if use_val_split:
-        ds_train = Messidor2Dataset(Path(args.images_dir), mdf_train, tfm)
-        dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=args.pin_memory)
-    
-    # Step 1: Adaptive BatchNorm (update BN stats on Messidor-2, no labels needed)
-    if args.adapt_bn:
-        print("\n📊 Adapting BatchNorm statistics on Messidor-2...")
-        model.train()  # Set to train mode so BN uses batch statistics
-        for module in model.modules():
-            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                module.track_running_stats = True
-                module.momentum = 0.1  # Faster adaptation
-        
-        num_bn_batches = min(50, len(dl_train))
-        with torch.no_grad():
-            for batch_idx, (images, _) in enumerate(dl_train):
-                if batch_idx >= num_bn_batches:
-                    break
-                images = images.to(device)
-                _ = model(images)  # Forward pass updates BN stats
-                if (batch_idx + 1) % 10 == 0:
-                    print(f"  Processed {batch_idx + 1}/{num_bn_batches} batches...")
-        model.eval()
-        print("✅ BN statistics adapted")
-
-    # Inference with temperature scaling
+    # Run inference
     use_amp = torch.cuda.is_available() or (torch.backends.mps.is_available() if hasattr(torch.backends, "mps") else False)
     dev_type = "cuda" if torch.cuda.is_available() else ("mps" if use_amp and hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
     
-    def run_inference(dataloader, dataset_name="test", temperature=1.0):
-        """Run inference with optional temperature scaling."""
-        all_logits = []
-        all_ids = []
-        total_batches = len(dataloader)
-        print(f"Running inference on {len(dataloader.dataset)} {dataset_name} images ({total_batches} batches)...")
-        if temperature != 1.0:
-            print(f"  Using temperature scaling: T={temperature:.3f}")
-        
-        with torch.inference_mode(), torch.autocast(device_type=dev_type, enabled=(dev_type != "cpu")):
-            for batch_idx, (xb, ids) in enumerate(dataloader, 1):
-                xb = xb.to(device)
-                outputs = model(xb)
-                
-                # Handle tuple output (take first element if tuple)
-                if isinstance(outputs, tuple):
-                    logits_avg = outputs[0]
-                else:
-                    logits_avg = outputs
-                if hasattr(logits_avg, "logits"):
-                    logits_avg = logits_avg.logits
-                elif isinstance(logits_avg, (tuple, list)):
-                    logits_avg = logits_avg[0]
-                
-                # Apply temperature scaling
-                logits_scaled = logits_avg / temperature
-                all_logits.append(logits_scaled.cpu())
-                
-                all_ids.extend(ids)
-                
-                if batch_idx % 10 == 0 or batch_idx == total_batches:
-                    print(f"  Processed {batch_idx}/{total_batches} batches ({len(all_ids)} images)...", flush=True)
-        
-        all_logits = torch.cat(all_logits, dim=0)
-        all_probs = torch.sigmoid(all_logits).numpy()
-        
-        print(f"✅ Inference complete: {all_probs.shape[0]} images, {all_probs.shape[1]} classes.")
-        return all_probs, all_ids
+    print(f"Running inference on {len(dl_test.dataset)} images ({len(dl_test)} batches)...")
+    all_logits = []
+    all_ids = []
+    total_batches = len(dl_test)
     
-    # Step 2: Temperature scaling (fit on validation split, apply to test)
-    # True one-parameter temperature scaling: minimize NLL w.r.t. T
-    temperature = 1.0
-    if args.use_temperature_scaling and use_val_split:
-        print("\n📊 Fitting temperature scaling on validation split...")
-        # Get raw logits (without temperature scaling) for fitting
-        # Optionally use subset for faster calibration
-        subset_indices = None
-        if args.temp_scaling_subset is not None and args.temp_scaling_subset < len(dl_train.dataset):
-            print(f"  Using subset of {args.temp_scaling_subset} images for faster calibration...")
-            from torch.utils.data import Subset
-            np.random.seed(args.seed)  # For reproducibility
-            subset_indices = np.random.choice(len(dl_train.dataset), args.temp_scaling_subset, replace=False)
-            dl_train_subset = DataLoader(Subset(dl_train.dataset, subset_indices), 
-                                        batch_size=args.batch_size, shuffle=False,
-                                        num_workers=args.num_workers, pin_memory=args.pin_memory)
-            dl_train_for_temp = dl_train_subset
-            total_batches = len(dl_train_subset)
-        else:
-            dl_train_for_temp = dl_train
-            total_batches = len(dl_train)
-        
-        print(f"  Running inference on {len(dl_train_for_temp.dataset)} images ({total_batches} batches)...")
-        all_logits_train_raw = []
-        with torch.inference_mode(), torch.autocast(device_type=dev_type, enabled=(dev_type != "cpu")):
-            for batch_idx, (xb, _) in enumerate(dl_train_for_temp, 1):
-                xb = xb.to(device)
-                outputs = model(xb)
-                # Handle tuple output (take first element if tuple)
-                if isinstance(outputs, tuple):
-                    logits = outputs[0]
-                else:
-                    logits = outputs
-                if hasattr(logits, "logits"):
-                    logits = logits.logits
-                elif isinstance(logits, (tuple, list)):
-                    logits = logits[0]
-                all_logits_train_raw.append(logits.cpu())
-                
-                if batch_idx % 20 == 0 or batch_idx == total_batches:
-                    print(f"  Processed {batch_idx}/{total_batches} batches ({batch_idx * args.batch_size} images)...", flush=True)
-        
-        print("  Concatenating logits...", flush=True)
-        all_logits_train_raw = torch.cat(all_logits_train_raw, dim=0)
-        # Get corresponding labels for the subset used
-        if subset_indices is not None:
-            y_dr_train = (mdf_train.iloc[subset_indices]["diagnosis"].astype(int) > 0).astype(np.int32).values
-        else:
-            y_dr_train = (mdf_train["diagnosis"].astype(int) > 0).astype(np.int32).values
-        
-        # Use DR head logits from multilabel classifier
-        dr_logits_train = all_logits_train_raw[:, dr_idx]  # Keep as tensor
-        print(f"  Using DR head logits from multilabel classifier for temperature scaling")
-        
-        print("  Optimizing temperature parameter...", flush=True)
-        # True temperature scaling: optimize T by minimizing NLL
-        T = torch.ones(1, requires_grad=True, device=device)
-        y_val_t = torch.tensor(y_dr_train, dtype=torch.float32, device=device)
-        logits_val_t = dr_logits_train.to(device)
-        
-        opt = torch.optim.LBFGS([T], lr=0.1, max_iter=50, line_search_fn='strong_wolfe')
-        
-        def nll():
-            opt.zero_grad()
-            z = logits_val_t / T.clamp_min(1e-3)
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(z, y_val_t)
-            loss.backward()
-            return loss
-        
-        try:
-            opt.step(nll)
-            temperature = float(T.clamp(0.1, 10.0).item())
-            print(f"  ✅ Fitted temperature: T={temperature:.3f}")
-        except Exception as e:
-            print(f"  ⚠️  Temperature scaling optimization failed: {e}")
-            print(f"  Using default temperature: T=1.0")
-            temperature = 1.0
+    with torch.inference_mode(), torch.autocast(device_type=dev_type, enabled=(dev_type != "cpu")):
+        for batch_idx, (xb, ids) in enumerate(dl_test, 1):
+            xb = xb.to(device)
+            outputs = model(xb)
+            
+            # Handle tuple output (take first element if tuple)
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
+            if hasattr(logits, "logits"):
+                logits = logits.logits
+            elif isinstance(logits, (tuple, list)):
+                logits = logits[0]
+            
+            all_logits.append(logits.cpu())
+            all_ids.extend(ids)
+            
+            if batch_idx % 10 == 0 or batch_idx == total_batches:
+                print(f"  Processed {batch_idx}/{total_batches} batches ({len(all_ids)} images)...", flush=True)
     
-    # Run inference on test set (with temperature scaling if fitted)
-    all_probs, all_ids = run_inference(dl_test, "test", temperature=temperature)
+    all_logits = torch.cat(all_logits, dim=0)
+    all_probs = torch.sigmoid(all_logits).numpy()
+    
+    print(f"✅ Inference complete: {all_probs.shape[0]} images, {all_probs.shape[1]} classes.")
     
     # Scores for endpoints (DR-only for Messidor-2)
     # Always use DR head from multilabel classifier with RFMiD threshold
@@ -1048,6 +956,14 @@ def main():
     print(f"DR - Sensitivity: {sensitivity_dr:.4f} | Specificity: {specificity_dr:.4f} | "
           f"Balanced Acc: {balanced_accuracy_dr:.4f} | Accuracy: {accuracy_dr:.4f}")
 
+    # Calculate metrics at 80% specificity threshold
+    thr_80spec_dr, spec_80spec_dr, sens_80spec_dr = pick_threshold_for_specificity(y_dr, dr_scores, target_spec=0.8)
+    prec_80spec_dr, rec_80spec_dr, f1_80spec_dr, tp_80spec_dr, tn_80spec_dr, fp_80spec_dr, fn_80spec_dr = f1_at_threshold(y_dr, dr_scores, thr_80spec_dr)
+    accuracy_80spec_dr = (tp_80spec_dr + tn_80spec_dr) / (tp_80spec_dr + tn_80spec_dr + fp_80spec_dr + fn_80spec_dr + 1e-8)
+    balanced_accuracy_80spec_dr = 0.5 * (sens_80spec_dr + spec_80spec_dr)
+    print(f"DR @80% Spec - Threshold: {thr_80spec_dr:.6f} | Sensitivity: {sens_80spec_dr:.4f} | Specificity: {spec_80spec_dr:.4f} | "
+          f"F1: {f1_80spec_dr:.4f} | Accuracy: {accuracy_80spec_dr:.4f}")
+
     # Referable DR (optional)
     if args.with_referable_dr:
         auc_rdr = safe_auc(y_dr_referr, dr_scores)
@@ -1060,6 +976,14 @@ def main():
         accuracy_rdr = (tp_rdr + tn_rdr) / (tp_rdr + tn_rdr + fp_rdr + fn_rdr + 1e-8)
         print(f"Referable DR - Sensitivity: {sensitivity_rdr:.4f} | Specificity: {specificity_rdr:.4f} | "
               f"Balanced Acc: {balanced_accuracy_rdr:.4f} | Accuracy: {accuracy_rdr:.4f}")
+        
+        # Calculate Referable DR metrics at 80% specificity threshold
+        thr_80spec_rdr, spec_80spec_rdr, sens_80spec_rdr = pick_threshold_for_specificity(y_dr_referr, dr_scores, target_spec=0.8)
+        prec_80spec_rdr, rec_80spec_rdr, f1_80spec_rdr, tp_80spec_rdr, tn_80spec_rdr, fp_80spec_rdr, fn_80spec_rdr = f1_at_threshold(y_dr_referr, dr_scores, thr_80spec_rdr)
+        accuracy_80spec_rdr = (tp_80spec_rdr + tn_80spec_rdr) / (tp_80spec_rdr + tn_80spec_rdr + fp_80spec_rdr + fn_80spec_rdr + 1e-8)
+        balanced_accuracy_80spec_rdr = 0.5 * (sens_80spec_rdr + spec_80spec_rdr)
+        print(f"Referable DR @80% Spec - Threshold: {thr_80spec_rdr:.6f} | Sensitivity: {sens_80spec_rdr:.4f} | Specificity: {spec_80spec_rdr:.4f} | "
+              f"F1: {f1_80spec_rdr:.4f} | Accuracy: {accuracy_80spec_rdr:.4f}")
 
     # Save metrics
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1086,6 +1010,19 @@ def main():
         f.write(f"f1max_threshold,{thr_f1_dr:.6f}\n")
         f.write(f"f1max_precision,{prec_f1_dr:.6f}\n")
         f.write(f"f1max_recall,{rec_f1_dr:.6f}\n")
+        # Metrics at 80% specificity
+        f.write(f"threshold_80spec,{thr_80spec_dr:.6f}\n")
+        f.write(f"sensitivity_80spec,{sens_80spec_dr:.6f}\n")
+        f.write(f"specificity_80spec,{spec_80spec_dr:.6f}\n")
+        f.write(f"precision_80spec,{prec_80spec_dr:.6f}\n")
+        f.write(f"recall_80spec,{rec_80spec_dr:.6f}\n")
+        f.write(f"f1_80spec,{f1_80spec_dr:.6f}\n")
+        f.write(f"accuracy_80spec,{accuracy_80spec_dr:.6f}\n")
+        f.write(f"balanced_accuracy_80spec,{balanced_accuracy_80spec_dr:.6f}\n")
+        f.write(f"tp_80spec,{int(tp_80spec_dr)}\n")
+        f.write(f"tn_80spec,{int(tn_80spec_dr)}\n")
+        f.write(f"fp_80spec,{int(fp_80spec_dr)}\n")
+        f.write(f"fn_80spec,{int(fn_80spec_dr)}\n")
 
     # Referable DR (optional)
     if args.with_referable_dr:
@@ -1097,6 +1034,7 @@ def main():
             f.write(f"threshold_rfmid_dr,{tau_dr:.6f}\n")  # Keep for reference
             f.write(f"Precision@Thr,{prec_rdr*100:.4f}\n")
             f.write(f"Recall@Thr (%),{rec_rdr*100:.4f}\n")
+            f.write(f"F1@Thr,{f1_rdr:.6f}\n")
             f.write(f"Sensitivity,{sensitivity_rdr:.6f}\n")
             f.write(f"Specificity,{specificity_rdr:.6f}\n")
             f.write(f"Balanced_Accuracy,{balanced_accuracy_rdr:.6f}\n")
@@ -1109,6 +1047,19 @@ def main():
             f.write(f"F1max_Threshold,{thr_f1_rdr:.6f}\n")
             f.write(f"F1max_Precision,{prec_f1_rdr*100:.4f}\n")
             f.write(f"F1max_Recall (%),{rec_f1_rdr*100:.4f}\n")
+            # Metrics at 80% specificity
+            f.write(f"Threshold_80Spec,{thr_80spec_rdr:.6f}\n")
+            f.write(f"Sensitivity_80Spec,{sens_80spec_rdr:.6f}\n")
+            f.write(f"Specificity_80Spec,{spec_80spec_rdr:.6f}\n")
+            f.write(f"Precision_80Spec,{prec_80spec_rdr*100:.4f}\n")
+            f.write(f"Recall_80Spec (%),{rec_80spec_rdr*100:.4f}\n")
+            f.write(f"F1_80Spec,{f1_80spec_rdr:.6f}\n")
+            f.write(f"Accuracy_80Spec,{accuracy_80spec_rdr:.6f}\n")
+            f.write(f"Balanced_Accuracy_80Spec,{balanced_accuracy_80spec_rdr:.6f}\n")
+            f.write(f"TP_80Spec,{int(tp_80spec_rdr)}\n")
+            f.write(f"TN_80Spec,{int(tn_80spec_rdr)}\n")
+            f.write(f"FP_80Spec,{int(fp_80spec_rdr)}\n")
+            f.write(f"FN_80Spec,{int(fn_80spec_rdr)}\n")
 
     # Save per-image outputs
     out_npz = results_dir / "messidor2_per_image_outputs.npz"

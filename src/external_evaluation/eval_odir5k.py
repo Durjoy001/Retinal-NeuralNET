@@ -305,8 +305,8 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
                         f"but got {len(thresholds)} thresholds in file.")
     
     # Use Disease_Risk threshold from RFMiD validation set (always use this fixed threshold)
-    tau_dr = float(thresholds[disease_risk_idx])
-    print(f"✅ Using RFMiD validation threshold for Disease_Risk: {tau_dr:.6f}")
+    tau_disease_risk = float(thresholds[disease_risk_idx])
+    print(f"✅ Using RFMiD validation threshold for Disease_Risk: {tau_disease_risk:.6f}")
     
     # Load checkpoint
     if not Path(ckpt_path).exists():
@@ -358,6 +358,22 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
             if any(k.startswith("h.") for k in state_keys):
                 state = {k.replace("h.", "classifier."): v for k, v in state.items()}
     
+    # Handle key remapping for ViT/Hybrid models (checkpoint may use "classifier.*" but model expects "multilabel_classifier.*")
+    if model_name_lower in ["swin_tiny", "vit_small", "deit_small", "crossvit_small", "coatnet0", "maxvit_tiny"]:
+        # Remap "classifier.*" to "multilabel_classifier.*" if needed
+        # Also add "classifier.*" keys for backward compatibility (model has both attributes pointing to same object)
+        if any(k.startswith("classifier.") for k in state_keys) and not any(k.startswith("multilabel_classifier.") for k in state_keys):
+            new_state = {}
+            for k, v in state.items():
+                if k.startswith("classifier."):
+                    # Add both multilabel_classifier.* (primary) and classifier.* (backward compat)
+                    new_state[k.replace("classifier.", "multilabel_classifier.")] = v
+                    new_state[k] = v  # Keep original for backward compatibility
+                else:
+                    new_state[k] = v
+            state = new_state
+            print(f"  ✅ Remapped checkpoint keys: classifier.* → multilabel_classifier.* (and kept classifier.* for backward compatibility)")
+    
     # CLIP and SigLIP adapters may not match RFMiD checkpoint format; handle gracefully
     if "clip" in model_name_lower or "biomedclip" in model_name_lower or "siglip" in model_name_lower:
         # VLM adapters may not load your RFMiD heads; use the adapter weights only
@@ -377,12 +393,6 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
             print(f"⚠️  Warning: Missing keys: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"⚠️  Warning: Missing keys: {missing_keys}")
         if unexpected_keys:
             print(f"⚠️  Warning: Unexpected keys: {unexpected_keys[:5]}..." if len(unexpected_keys) > 5 else f"⚠️  Warning: Unexpected keys: {unexpected_keys}")
-    
-    missing_keys, unexpected_keys = model.load_state_dict(state, strict=False)
-    if missing_keys:
-        print(f"⚠️  Warning: Missing keys: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"⚠️  Warning: Missing keys: {missing_keys}")
-    if unexpected_keys:
-        print(f"⚠️  Warning: Unexpected keys: {unexpected_keys[:5]}..." if len(unexpected_keys) > 5 else f"⚠️  Warning: Unexpected keys: {unexpected_keys}")
     
     model.eval()
     print(f"  ✅ Model loaded and set to eval mode")
@@ -414,7 +424,7 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
 
     # Always use Disease_Risk head from multilabel classifier with RFMiD threshold
     print(f"  Using Disease_Risk head from multilabel classifier for ODIR-5K (any abnormal detection)")
-    print(f"  Using RFMiD validation threshold: {tau_dr:.6f}")
+    print(f"  Using RFMiD validation threshold: {tau_disease_risk:.6f}")
 
     # Run inference on test set
     print(f"\n  📊 Running inference on test set...")
@@ -432,10 +442,10 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
             outputs = model(xb)
             
             # Handle tuple output (take first element if tuple)
-                if isinstance(outputs, tuple):
+            if isinstance(outputs, tuple):
                 multilabel_logits = outputs[0]
-                else:
-                    multilabel_logits = outputs
+            else:
+                multilabel_logits = outputs
             if hasattr(multilabel_logits, "logits"):
                 multilabel_logits = multilabel_logits.logits
             elif isinstance(multilabel_logits, (tuple, list)):
@@ -443,12 +453,12 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
             
             all_logits.append(multilabel_logits.cpu())
             y_true_list.append(yb.numpy())
-                
-                # Progress indicator
-                if batch_idx % 10 == 0 or batch_idx == total_batches:
+            
+            # Progress indicator
+            if batch_idx % 10 == 0 or batch_idx == total_batches:
                 processed = batch_idx * batch_size
                 actual_processed = min(processed, len(test_loader.dataset))
-                    print(f"    Processed {batch_idx}/{total_batches} batches (~{actual_processed} images)...", flush=True)
+                print(f"    Processed {batch_idx}/{total_batches} batches (~{actual_processed} images)...", flush=True)
         
     all_logits = torch.cat(all_logits, dim=0)
     all_probs = torch.sigmoid(all_logits).numpy()
@@ -462,10 +472,10 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
     print(f"  Using Disease_Risk head from multilabel classifier for any abnormal detection")
     
     # Debug: Print threshold and score distribution
-    print(f"\n[Debug] tau_disease_risk (RFMiD): {tau_dr:.6f}")
+    print(f"\n[Debug] tau_disease_risk (RFMiD): {tau_disease_risk:.6f}")
     print(f"[Debug] disease_risk_scores (test): min={disease_risk_scores.min():.4f}  p25={np.percentile(disease_risk_scores,25):.4f}  "
           f"median={np.median(disease_risk_scores):.4f}  p75={np.percentile(disease_risk_scores,75):.4f}  max={disease_risk_scores.max():.4f}")
-    print(f"[Debug] % predicted positive @tau_disease_risk: {(disease_risk_scores >= tau_dr).mean()*100:.2f}%")
+    print(f"[Debug] % predicted positive @tau_disease_risk: {(disease_risk_scores >= tau_disease_risk).mean()*100:.2f}%")
     print(f"[Debug] Ground truth (test): {y_t.sum()}/{len(y_t)} positive ({y_t.mean()*100:.2f}%)")
     
     s_t = any_scores
@@ -541,16 +551,16 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
         print(f"    Spec80_onTest: threshold={thr80:.6f}, sens={sens80:.3f}, spec={spec80:.3f}")
 
         # Always use RFMiD threshold (standard approach)
-        print(f"    RFMiD_thr: threshold={tau_dr:.6f} (fixed from RFMiD validation)")
-        rfmid_metrics = eval_at_thr("RFMiD_thr", tau_dr)
-            results.update(rfmid_metrics)
+        print(f"    RFMiD_thr: threshold={tau_disease_risk:.6f} (fixed from RFMiD validation)")
+        rfmid_metrics = eval_at_thr("RFMiD_thr", tau_disease_risk)
+        results.update(rfmid_metrics)
         print(f"    RFMiD_thr: sens={rfmid_metrics['RFMiD_thr_Sensitivity']:.3f}, "
-                  f"spec={rfmid_metrics['RFMiD_thr_Specificity']:.3f}, acc={rfmid_metrics['RFMiD_thr_Accuracy']:.3f}")
+              f"spec={rfmid_metrics['RFMiD_thr_Specificity']:.3f}, acc={rfmid_metrics['RFMiD_thr_Accuracy']:.3f}")
 
     # Add patient-level metrics to results
     results.update(patient_metrics)
-    results["threshold_rfmid_disease_risk"] = float(tau_dr)
-    results["threshold_used"] = float(tau_dr)
+    results["threshold_rfmid_disease_risk"] = float(tau_disease_risk)
+    results["threshold_used"] = float(tau_disease_risk)
     results["threshold_type"] = "rfmid"
     results["head_used"] = "Disease_Risk"
 
