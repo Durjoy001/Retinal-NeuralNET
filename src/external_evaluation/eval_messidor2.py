@@ -368,13 +368,86 @@ class CLIPAdapter(ModelAdapter):
             def cache_prompts(self, device):
                 if self._prompts_cached:
                     return
-                prompts = [f"a fundus photograph with {name}" for name in self.class_names]
-                with torch.no_grad():
-                    text_tokens = open_clip.tokenize(prompts).to(device)
-                    text_embeds = self.base_model.encode_text(text_tokens)
-                    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-                self.cached_text_embeds.resize_(text_embeds.shape)
-                self.cached_text_embeds.copy_(text_embeds)
+                
+                # Use the same sophisticated prompts as in train_vlm.py for consistency
+                class_prompts = {
+                    "Disease_Risk": [
+                        "a retinal fundus photograph showing any retinal pathology or abnormal finding",
+                        "a retinal fundus photograph with signs of disease or abnormal retina"
+                    ],
+                    "DR": [
+                        "a retinal fundus photograph with diabetic retinopathy featuring microaneurysms dot blot hemorrhages and hard exudates near the macula",
+                        "a retinal fundus photograph with diabetic retinopathy showing scattered intraretinal hemorrhages cotton wool spots and possible neovascularization"
+                    ],
+                    "ARMD": [
+                        "a retinal fundus photograph with age-related macular degeneration showing drusen and geographic atrophy",
+                        "a retinal fundus photograph with age-related macular degeneration featuring large soft drusen and pigmentary changes"
+                    ],
+                    "MH": [
+                        "a retinal fundus photograph with macular hole showing full-thickness foveal defect with operculum",
+                        "a retinal fundus photograph with macular hole and surrounding cuff of subretinal fluid"
+                    ],
+                    "DN": [
+                        "a retinal fundus photograph with diabetic maculopathy showing hard exudates and macular edema",
+                        "a retinal fundus photograph with diabetic maculopathy featuring circinate rings of exudates and retinal thickening"
+                    ],
+                    "MYA": [
+                        "a retinal fundus photograph with myopia showing myopic maculopathy and chorioretinal atrophy",
+                        "a retinal fundus photograph with high myopia and posterior staphyloma"
+                    ],
+                    "BRVO": [
+                        "a retinal fundus photograph with branch retinal vein occlusion showing flame-shaped hemorrhages and cotton wool spots",
+                        "a retinal fundus photograph with branch retinal vein occlusion in the superior or inferior quadrant"
+                    ],
+                    "CRVO": [
+                        "a retinal fundus photograph with central retinal vein occlusion showing extensive retinal hemorrhages and disc edema",
+                        "a retinal fundus photograph with central retinal vein occlusion and macular edema"
+                    ],
+                    "RAO": [
+                        "a retinal fundus photograph with retinal artery occlusion showing cherry red spot and retinal whitening",
+                        "a retinal fundus photograph with central or branch retinal artery occlusion"
+                    ],
+                    "CSCR": [
+                        "a retinal fundus photograph with central serous chorioretinopathy showing serous retinal detachment at the macula",
+                        "a retinal fundus photograph with central serous chorioretinopathy and pigment epithelial detachment"
+                    ],
+                    "RPEC": [
+                        "a retinal fundus photograph with retinal pigment epithelium changes showing mottling and hyper or hypopigmentation",
+                        "a retinal fundus photograph with irregular retinal pigment epithelium at the macula and midperiphery"
+                    ],
+                    "MHL": [
+                        "a retinal fundus photograph with lamellar macular hole showing partial thickness foveal defect with irregular foveal contour",
+                        "a retinal fundus photograph with lamellar macular hole and epiretinal proliferation"
+                    ],
+                    "RP": [
+                        "a retinal fundus photograph with retinitis pigmentosa showing bone spicule pigmentation attenuated vessels and waxy disc pallor",
+                        "a retinal fundus photograph with peripheral bone spicule pigment and narrow arterioles typical of retinitis pigmentosa"
+                    ],
+                    "OTHER": [
+                        "a retinal fundus photograph with an uncommon retinal pathology not listed among other classes",
+                        "a retinal fundus photograph with miscellaneous retinal abnormality outside predefined categories"
+                    ],
+                }
+                
+                # Encode all class prompts and average per class (matches train_vlm.py)
+                all_txt = []
+                for cname in self.class_names:
+                    variants = class_prompts.get(cname, [f"a retinal fundus photograph with {cname.lower()}"])
+                    tokens = open_clip.tokenize(variants).to(device)
+                    self.base_model.eval()
+                    with torch.no_grad():
+                        emb = self.base_model.encode_text(tokens)
+                        emb = emb / emb.norm(dim=-1, keepdim=True)
+                        emb = emb.mean(dim=0, keepdim=True)  # average over variants
+                    all_txt.append(emb)
+                
+                txt = torch.cat(all_txt, dim=0)  # [num_classes, D]
+                
+                # Resize and copy to keep it as a registered buffer
+                if self.cached_text_embeds.numel() == 0:
+                    self.cached_text_embeds.resize_as_(txt.detach().cpu()).copy_(txt.detach().cpu())
+                else:
+                    self.cached_text_embeds.copy_(txt.detach().cpu())
                 self._prompts_cached = True
 
             def forward(self, x):
@@ -729,6 +802,11 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device)
     state = ckpt.get("model_state_dict", ckpt)
     
+    # Debug: Print checkpoint structure for CLIP models
+    if "clip" in args.model_name.lower() or "biomedclip" in args.model_name.lower():
+        print(f"  🔍 Checkpoint structure: top-level keys = {list(ckpt.keys())[:10]}")
+        print(f"  🔍 State dict keys sample: {list(state.keys())[:10]}")
+    
     # Build model via adapter - always use multilabel classifier (includes DR class)
     num_classes = len(label_columns)
     
@@ -826,12 +904,66 @@ def main():
                     print(f"  ℹ️  Removing cached_text_embeds from checkpoint (shape mismatch: {checkpoint_shape} vs {model_shape}), will be recomputed")
                     state = {k: v for k, v in state.items() if k != "cached_text_embeds"}
         
+        # Debug: Check critical CLIP keys
+        if "clip" in model_name_lower or "biomedclip" in model_name_lower:
+            critical_keys = ["logit_scale", "class_bias", "base_model.visual"]
+            has_logit_scale = any("logit_scale" in k for k in state_keys)
+            has_class_bias = any("class_bias" in k for k in state_keys)
+            has_base_visual = any("base_model.visual" in k for k in state_keys)
+            print(f"  🔍 CLIP checkpoint check: logit_scale={has_logit_scale}, class_bias={has_class_bias}, base_model.visual={has_base_visual}")
+            
+            # Check if we need to remap keys (e.g., if checkpoint has different prefix)
+            if not has_base_visual and not has_logit_scale:
+                # Try to find keys with different prefixes
+                visual_keys = [k for k in state_keys if "visual" in k.lower()]
+                if visual_keys:
+                    print(f"  ℹ️  Found visual keys with different prefix: {visual_keys[:3]}...")
+                    # Try remapping common patterns
+                    if any("base_model.visual" not in k and "visual" in k for k in state_keys):
+                        # Check if we need to add "base_model." prefix
+                        new_state = {}
+                        for k, v in state.items():
+                            if k.startswith("visual.") and not k.startswith("base_model."):
+                                new_state["base_model." + k] = v
+                            elif k.startswith("base_model.") or "logit_scale" in k or "class_bias" in k:
+                                new_state[k] = v
+                            else:
+                                new_state[k] = v
+                        state = new_state
+                        state_keys = set(state.keys())
+                        print(f"  ✅ Attempted key remapping for CLIP model")
+        
         try:
             missing_keys, unexpected_keys = model.load_state_dict(state, strict=False)
+            
+            # Validate critical keys were loaded for CLIP
+            if "clip" in model_name_lower or "biomedclip" in model_name_lower:
+                # Check which keys from checkpoint actually matched and loaded
+                model_state = model.state_dict()
+                loaded_keys = set(model_state.keys())
+                
+                # Check if critical parameters exist in model
+                logit_keys = [k for k in loaded_keys if "logit_scale" in k]
+                bias_keys = [k for k in loaded_keys if "class_bias" in k]
+                visual_keys = [k for k in loaded_keys if "base_model.visual" in k]
+                
+                # Check if they were actually loaded from checkpoint (not just initialized)
+                logit_loaded = len(logit_keys) > 0 and any(k in state_keys for k in logit_keys)
+                bias_loaded = len(bias_keys) > 0 and any(k in state_keys for k in bias_keys)
+                visual_loaded = len(visual_keys) > 0 and any(k in state_keys for k in visual_keys[:5])  # Check first few
+                
+                if not (logit_loaded and bias_loaded and visual_loaded):
+                    print(f"  ⚠️  CRITICAL WARNING: CLIP weights may not have loaded correctly!")
+                    print(f"     Checkpoint has logit_scale: {logit_loaded}, class_bias: {bias_loaded}, base_model.visual: {visual_loaded}")
+                    print(f"     Missing keys: {[k for k in missing_keys if 'logit_scale' in k or 'class_bias' in k or 'base_model.visual' in k][:5]}")
+                    print(f"     This will cause poor performance. The model may be using untrained weights.")
+                else:
+                    print(f"  ✅ CLIP critical weights verified: logit_scale, class_bias, base_model.visual")
+            
             if missing_keys:
-                print(f"⚠️  Warning: Missing keys in {vlm_type} checkpoint: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"⚠️  Warning: Missing keys: {missing_keys}")
+                print(f"⚠️  Warning: Missing keys in {vlm_type} checkpoint: {missing_keys[:10]}..." if len(missing_keys) > 10 else f"⚠️  Warning: Missing keys: {missing_keys}")
             if unexpected_keys:
-                print(f"⚠️  Warning: Unexpected keys in {vlm_type} checkpoint: {unexpected_keys[:5]}..." if len(unexpected_keys) > 5 else f"⚠️  Warning: Unexpected keys: {unexpected_keys}")
+                print(f"⚠️  Warning: Unexpected keys in {vlm_type} checkpoint: {unexpected_keys[:10]}..." if len(unexpected_keys) > 10 else f"⚠️  Warning: Unexpected keys: {unexpected_keys}")
         except Exception as e:
             print(f"⚠️  Skipping strict {vlm_type} state dict load (checkpoint format may not match); using adapter only.")
             print(f"   Error: {e}")
