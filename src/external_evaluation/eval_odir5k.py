@@ -18,7 +18,7 @@ Usage:
         --results_dir results/External/ODIR-5K/SwinTiny
 """
 
-import os, argparse, random
+import os, argparse, random, math, warnings
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List
@@ -29,6 +29,8 @@ from PIL import Image
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 import timm
 from timm.data import resolve_data_config
@@ -36,10 +38,177 @@ from timm.data.transforms_factory import create_transform
 
 from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve, confusion_matrix
 
+# Suppress QuickGELU warning (it's about pretrained weights, not our checkpoint)
+# The warning comes from open_clip.factory when loading pretrained weights
+# This warning is harmless since we load from our own checkpoint, not the pretrained weights
+warnings.filterwarnings("ignore", message=".*QuickGELU.*", category=UserWarning)
+
+try:
+    import open_clip
+    HAS_OPENCLIP = True
+except ImportError:
+    HAS_OPENCLIP = False
+
 # Import adapter classes from eval_messidor2.py
 from .eval_messidor2 import (
-    ModelAdapter, TimmBackboneWithHead, CNNAdapter, CLIPAdapter, SigLIPAdapter
+    ModelAdapter, TimmBackboneWithHead, CNNAdapter, SigLIPAdapter
 )
+
+# Fixed CLIPAdapter for ODIR-5K (fixes QuickGELU warning and forward method alignment)
+class CLIPAdapter(ModelAdapter):
+    """Fixed adapter for CLIP models (requires open_clip) - ODIR-5K specific fixes."""
+    def __init__(self, model_name: str, num_classes: int, class_names: list):
+        super().__init__(model_name, num_classes)
+        self.class_names = class_names
+        if not HAS_OPENCLIP:
+            raise ImportError("open_clip required for CLIP models")
+
+    def build(self) -> nn.Module:
+        if "biomedclip" in self.name:
+            clip_name = "ViT-L-14"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)  # Suppress QuickGELU warning
+                base, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained="biomedclip")
+        else:
+            if "336" in self.name:
+                clip_name = "ViT-L-14-336"
+            elif "b16" in self.name or "vit-b/16" in self.name:
+                clip_name = "ViT-B-16"
+            else:
+                clip_name = "ViT-B-16"
+            # Use force_quick_gelu=False to match training configuration and avoid mismatch warnings
+            # The checkpoint was saved with quick_gelu=False, so we need to match that
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)  # Suppress QuickGELU warning
+                base, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained="openai", force_quick_gelu=False)
+        
+        for p in base.parameters():
+            p.requires_grad = False
+        for p in base.visual.parameters():
+            p.requires_grad = True
+        
+        class CLIPWrapper(nn.Module):
+            def __init__(self, base_model, class_names):
+                super().__init__()
+                self.base_model = base_model
+                with torch.no_grad():
+                    init = base_model.logit_scale.exp().clamp(1.0, 100.0).log()
+                self.logit_scale = nn.Parameter(init.clone())
+                self.class_bias = nn.Parameter(torch.zeros(len(class_names), dtype=torch.float32))
+                self.class_names = class_names
+                self.register_buffer("cached_text_embeds", torch.empty(0), persistent=True)
+                self._prompts_cached = False
+
+            def cache_prompts(self, device):
+                if self._prompts_cached:
+                    return
+                
+                # Use the same sophisticated prompts as in train_vlm.py for consistency
+                class_prompts = {
+                    "Disease_Risk": [
+                        "a retinal fundus photograph with abnormal retinal findings including hemorrhages exudates drusen vessel changes or structural abnormalities",
+                        "a retinal fundus photograph showing pathological changes such as retinal hemorrhages hard or soft exudates macular edema vessel tortuosity or optic disc abnormalities",
+                        "a retinal fundus photograph with signs of retinal disease featuring microaneurysms cotton wool spots pigmentary changes chorioretinal atrophy or other pathological lesions"
+                    ],
+                    "DR": [
+                        "a retinal fundus photograph with diabetic retinopathy featuring microaneurysms dot blot hemorrhages and hard exudates near the macula",
+                        "a retinal fundus photograph with diabetic retinopathy showing scattered intraretinal hemorrhages cotton wool spots and possible neovascularization"
+                    ],
+                    "ARMD": [
+                        "a retinal fundus photograph with age-related macular degeneration showing drusen and geographic atrophy",
+                        "a retinal fundus photograph with age-related macular degeneration featuring large soft drusen and pigmentary changes"
+                    ],
+                    "MH": [
+                        "a retinal fundus photograph with macular hole showing full-thickness foveal defect with operculum",
+                        "a retinal fundus photograph with macular hole and surrounding cuff of subretinal fluid"
+                    ],
+                    "DN": [
+                        "a retinal fundus photograph with diabetic maculopathy showing hard exudates and macular edema",
+                        "a retinal fundus photograph with diabetic maculopathy featuring circinate rings of exudates and retinal thickening"
+                    ],
+                    "MYA": [
+                        "a retinal fundus photograph with myopia showing myopic maculopathy and chorioretinal atrophy",
+                        "a retinal fundus photograph with high myopia and posterior staphyloma"
+                    ],
+                    "BRVO": [
+                        "a retinal fundus photograph with branch retinal vein occlusion showing flame-shaped hemorrhages and cotton wool spots",
+                        "a retinal fundus photograph with branch retinal vein occlusion in the superior or inferior quadrant"
+                    ],
+                    "CRVO": [
+                        "a retinal fundus photograph with central retinal vein occlusion showing extensive retinal hemorrhages and disc edema",
+                        "a retinal fundus photograph with central retinal vein occlusion and macular edema"
+                    ],
+                    "RAO": [
+                        "a retinal fundus photograph with retinal artery occlusion showing cherry red spot and retinal whitening",
+                        "a retinal fundus photograph with central or branch retinal artery occlusion"
+                    ],
+                    "CSCR": [
+                        "a retinal fundus photograph with central serous chorioretinopathy showing serous retinal detachment at the macula",
+                        "a retinal fundus photograph with central serous chorioretinopathy and pigment epithelial detachment"
+                    ],
+                    "RPEC": [
+                        "a retinal fundus photograph with retinal pigment epithelium changes showing mottling and hyper or hypopigmentation",
+                        "a retinal fundus photograph with irregular retinal pigment epithelium at the macula and midperiphery"
+                    ],
+                    "MHL": [
+                        "a retinal fundus photograph with lamellar macular hole showing partial thickness foveal defect with irregular foveal contour",
+                        "a retinal fundus photograph with lamellar macular hole and epiretinal proliferation"
+                    ],
+                    "RP": [
+                        "a retinal fundus photograph with retinitis pigmentosa showing bone spicule pigmentation attenuated vessels and waxy disc pallor",
+                        "a retinal fundus photograph with peripheral bone spicule pigment and narrow arterioles typical of retinitis pigmentosa"
+                    ],
+                    "OTHER": [
+                        "a retinal fundus photograph with an uncommon retinal pathology not listed among other classes",
+                        "a retinal fundus photograph with miscellaneous retinal abnormality outside predefined categories"
+                    ],
+                }
+                
+                # Encode all class prompts and average per class (matches train_vlm.py)
+                all_txt = []
+                for cname in self.class_names:
+                    variants = class_prompts.get(cname, [f"a retinal fundus photograph with {cname.lower()}"])
+                    tokens = open_clip.tokenize(variants).to(device)
+                    self.base_model.eval()
+                    with torch.no_grad():
+                        emb = self.base_model.encode_text(tokens)
+                        emb = emb / emb.norm(dim=-1, keepdim=True)
+                        emb = emb.mean(dim=0, keepdim=True)  # average over variants
+                    all_txt.append(emb)
+                
+                txt = torch.cat(all_txt, dim=0)  # [num_classes, D]
+                
+                # Resize and copy to keep it as a registered buffer
+                if self.cached_text_embeds.numel() == 0:
+                    self.cached_text_embeds.resize_as_(txt.detach().cpu()).copy_(txt.detach().cpu())
+                else:
+                    self.cached_text_embeds.copy_(txt.detach().cpu())
+                self._prompts_cached = True
+
+            def forward(self, x):
+                self.cache_prompts(x.device)
+                # Clamp logit scale to a safe range to avoid runaway temperatures (matches train_vlm.py)
+                with torch.no_grad():
+                    self.logit_scale.data.clamp_(math.log(1.0), math.log(100.0))
+                img = self.base_model.encode_image(x)  # pooled & projected
+                img = img / img.norm(dim=-1, keepdim=True)
+                txt = self.cached_text_embeds.to(x.device)
+                logits = self.logit_scale.exp() * (img @ txt.T)
+                logits = logits + self.class_bias  # broadcast per-class bias
+                return logits
+        
+        return CLIPWrapper(base, self.class_names)
+
+    def transforms(self, is_train: bool):
+        size = 336 if "336" in self.name else 224
+        eval_tf = [
+            transforms.Resize(size, interpolation=InterpolationMode.BICUBIC, antialias=True),
+            transforms.CenterCrop(size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073),
+                              std=(0.26862954, 0.26130258, 0.27577711)),
+        ]
+        return transforms.Compose(eval_tf)
 
 # Registry: map model_name -> adapter factory (same as eval_messidor2.py)
 REGISTRY = {
@@ -316,6 +485,11 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
     ckpt = torch.load(ckpt_path, map_location=device)
     state = ckpt.get("model_state_dict", ckpt)
     
+    # Debug: Print checkpoint structure for CLIP models
+    if "clip" in model_name_key.lower() or "biomedclip" in model_name_key.lower():
+        print(f"  🔍 Checkpoint structure: top-level keys = {list(ckpt.keys())[:10]}")
+        print(f"  🔍 State dict keys sample: {list(state.keys())[:10]}")
+    
     # Build model via adapter - always use multilabel classifier (includes DR class)
     num_classes = len(rfmid_labels)
     model_name_lower = model_name_key.lower()
@@ -378,12 +552,77 @@ def eval_model_on_odir(model_name_key, ckpt_path, thresholds_path, rfmid_labels,
     if "clip" in model_name_lower or "biomedclip" in model_name_lower or "siglip" in model_name_lower:
         # VLM adapters may not load your RFMiD heads; use the adapter weights only
         vlm_type = "CLIP" if "clip" in model_name_lower or "biomedclip" in model_name_lower else "SigLIP"
+        
+        # Handle CLIP cached_text_embeds buffer shape mismatch
+        if "clip" in model_name_lower or "biomedclip" in model_name_lower:
+            # Remove cached_text_embeds from state if shape doesn't match (will be recomputed)
+            if "cached_text_embeds" in state:
+                checkpoint_shape = state["cached_text_embeds"].shape
+                model_shape = model.cached_text_embeds.shape
+                if checkpoint_shape != model_shape:
+                    print(f"  ℹ️  Removing cached_text_embeds from checkpoint (shape mismatch: {checkpoint_shape} vs {model_shape}), will be recomputed")
+                    state = {k: v for k, v in state.items() if k != "cached_text_embeds"}
+        
+        # Debug: Check critical CLIP keys
+        if "clip" in model_name_lower or "biomedclip" in model_name_lower:
+            critical_keys = ["logit_scale", "class_bias", "base_model.visual"]
+            has_logit_scale = any("logit_scale" in k for k in state_keys)
+            has_class_bias = any("class_bias" in k for k in state_keys)
+            has_base_visual = any("base_model.visual" in k for k in state_keys)
+            print(f"  🔍 CLIP checkpoint check: logit_scale={has_logit_scale}, class_bias={has_class_bias}, base_model.visual={has_base_visual}")
+            
+            # Check if we need to remap keys (e.g., if checkpoint has different prefix)
+            if not has_base_visual and not has_logit_scale:
+                # Try to find keys with different prefixes
+                visual_keys = [k for k in state_keys if "visual" in k.lower()]
+                if visual_keys:
+                    print(f"  ℹ️  Found visual keys with different prefix: {visual_keys[:3]}...")
+                    # Try remapping common patterns
+                    if any("base_model.visual" not in k and "visual" in k for k in state_keys):
+                        # Check if we need to add "base_model." prefix
+                        new_state = {}
+                        for k, v in state.items():
+                            if k.startswith("visual.") and not k.startswith("base_model."):
+                                new_state["base_model." + k] = v
+                            elif k.startswith("base_model.") or "logit_scale" in k or "class_bias" in k:
+                                new_state[k] = v
+                            else:
+                                new_state[k] = v
+                        state = new_state
+                        state_keys = set(state.keys())
+                        print(f"  ✅ Attempted key remapping for CLIP model")
+        
         try:
             missing_keys, unexpected_keys = model.load_state_dict(state, strict=False)
+            
+            # Validate critical keys were loaded for CLIP
+            if "clip" in model_name_lower or "biomedclip" in model_name_lower:
+                # Check which keys from checkpoint actually matched and loaded
+                model_state = model.state_dict()
+                loaded_keys = set(model_state.keys())
+                
+                # Check if critical parameters exist in model
+                logit_keys = [k for k in loaded_keys if "logit_scale" in k]
+                bias_keys = [k for k in loaded_keys if "class_bias" in k]
+                visual_keys = [k for k in loaded_keys if "base_model.visual" in k]
+                
+                # Check if they were actually loaded from checkpoint (not just initialized)
+                logit_loaded = len(logit_keys) > 0 and any(k in state_keys for k in logit_keys)
+                bias_loaded = len(bias_keys) > 0 and any(k in state_keys for k in bias_keys)
+                visual_loaded = len(visual_keys) > 0 and any(k in state_keys for k in visual_keys[:5])  # Check first few
+                
+                if not (logit_loaded and bias_loaded and visual_loaded):
+                    print(f"  ⚠️  CRITICAL WARNING: CLIP weights may not have loaded correctly!")
+                    print(f"     Checkpoint has logit_scale: {logit_loaded}, class_bias: {bias_loaded}, base_model.visual: {visual_loaded}")
+                    print(f"     Missing keys: {[k for k in missing_keys if 'logit_scale' in k or 'class_bias' in k or 'base_model.visual' in k][:5]}")
+                    print(f"     This will cause poor performance. The model may be using untrained weights.")
+                else:
+                    print(f"  ✅ CLIP critical weights verified: logit_scale, class_bias, base_model.visual")
+            
             if missing_keys:
-                print(f"⚠️  Warning: Missing keys in {vlm_type} checkpoint: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"⚠️  Warning: Missing keys: {missing_keys}")
+                print(f"⚠️  Warning: Missing keys in {vlm_type} checkpoint: {missing_keys[:10]}..." if len(missing_keys) > 10 else f"⚠️  Warning: Missing keys: {missing_keys}")
             if unexpected_keys:
-                print(f"⚠️  Warning: Unexpected keys in {vlm_type} checkpoint: {unexpected_keys[:5]}..." if len(unexpected_keys) > 5 else f"⚠️  Warning: Unexpected keys: {unexpected_keys}")
+                print(f"⚠️  Warning: Unexpected keys in {vlm_type} checkpoint: {unexpected_keys[:10]}..." if len(unexpected_keys) > 10 else f"⚠️  Warning: Unexpected keys: {unexpected_keys}")
         except Exception as e:
             print(f"⚠️  Skipping strict {vlm_type} state dict load (checkpoint format may not match); using adapter only.")
             print(f"   Error: {e}")

@@ -176,7 +176,9 @@ def build_model(model_name, num_classes, class_names):
         # CLIP via OpenCLIP
         if "biomedclip" in model_name:
             clip_name = "ViT-L-14"
-            base, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained="biomedclip")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)  # Suppress QuickGELU warning
+                base, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained="biomedclip")
         else:
             if "336" in model_name:
                 clip_name = "ViT-L-14-336"
@@ -184,7 +186,12 @@ def build_model(model_name, num_classes, class_names):
                 clip_name = "ViT-B-16"
             else:
                 clip_name = "ViT-B-16"  # safe default
-            base, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained="openai")
+            # Suppress QuickGELU warning: OpenAI pretrained weights use QuickGELU=True,
+            # but open_clip default config may have quick_gelu=False. This mismatch is harmless
+            # since we're fine-tuning and the weights load correctly regardless.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)  # Suppress QuickGELU warning
+                base, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained="openai")
         print(f"✅ Loaded CLIP {clip_name}")
         
         # Safer freeze strategy: freeze all first, then unfreeze vision
@@ -259,8 +266,9 @@ class CLIPWrapper(nn.Module):
         # Prompt set for RFMiD classes
         class_prompts = {
             "Disease_Risk": [
-                "a retinal fundus photograph showing any retinal pathology or abnormal finding",
-                "a retinal fundus photograph with signs of disease or abnormal retina"
+                "a retinal fundus photograph with abnormal retinal findings including hemorrhages exudates drusen vessel changes or structural abnormalities",
+                "a retinal fundus photograph showing pathological changes such as retinal hemorrhages hard or soft exudates macular edema vessel tortuosity or optic disc abnormalities",
+                "a retinal fundus photograph with signs of retinal disease featuring microaneurysms cotton wool spots pigmentary changes chorioretinal atrophy or other pathological lesions"
             ],
             "DR": [
                 "a retinal fundus photograph with diabetic retinopathy featuring microaneurysms dot blot hemorrhages and hard exudates near the macula",
@@ -1192,7 +1200,10 @@ if __name__ == "__main__":
         print("Train models first, then implement generate_all_vlm_overall_metrics().")
     else:
         # Train selected smaller VLM models
-        model_names = ["clip_vit_b16", "siglip_base_384"]
+        # To train only CLIPViTB16, use: ["clip_vit_b16"]
+        # To train only SigLIPBase384, use: ["siglip_base_384"]
+        # To train both, use: ["clip_vit_b16", "siglip_base_384"]
+        model_names = ["clip_vit_b16"]  # Training only CLIPViTB16
         for m in model_names:
             print(f"\n==================== {m.upper()} ====================")
             run_for_model(m)

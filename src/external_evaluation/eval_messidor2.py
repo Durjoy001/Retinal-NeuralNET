@@ -212,7 +212,7 @@ class TimmBackboneWithHead(ModelAdapter):
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(self.head_dim, self.num_classes),
-        )
+            )
         
         class Wrapper(nn.Module):
             def __init__(self, backbone, multilabel_classifier):
@@ -372,8 +372,9 @@ class CLIPAdapter(ModelAdapter):
                 # Use the same sophisticated prompts as in train_vlm.py for consistency
                 class_prompts = {
                     "Disease_Risk": [
-                        "a retinal fundus photograph showing any retinal pathology or abnormal finding",
-                        "a retinal fundus photograph with signs of disease or abnormal retina"
+                        "a retinal fundus photograph with abnormal retinal findings including hemorrhages exudates drusen vessel changes or structural abnormalities",
+                        "a retinal fundus photograph showing pathological changes such as retinal hemorrhages hard or soft exudates macular edema vessel tortuosity or optic disc abnormalities",
+                        "a retinal fundus photograph with signs of retinal disease featuring microaneurysms cotton wool spots pigmentary changes chorioretinal atrophy or other pathological lesions"
                     ],
                     "DR": [
                         "a retinal fundus photograph with diabetic retinopathy featuring microaneurysms dot blot hemorrhages and hard exudates near the macula",
@@ -751,14 +752,14 @@ def main():
     # Load thresholds from RFMiD validation set
     if not Path(args.thresholds).exists():
         raise ValueError(f"Threshold file not found: {args.thresholds}")
-    thresholds = np.load(args.thresholds)
+        thresholds = np.load(args.thresholds)
 
     
     # Find DR index in label columns (always use DR head from multilabel classifier)
-    dr_idx = _find_label_index(label_columns, DR_ALIASES)
-    if dr_idx is None:
-        raise ValueError(f"Could not find DR column in RFMiD labels. Checked aliases: {DR_ALIASES}")
-    
+        dr_idx = _find_label_index(label_columns, DR_ALIASES)
+        if dr_idx is None:
+            raise ValueError(f"Could not find DR column in RFMiD labels. Checked aliases: {DR_ALIASES}")
+
     # Thresholds file handling: expect thresholds for all classes (including DR)
     expected_threshold_count = len(label_columns)
     if len(thresholds) != expected_threshold_count:
@@ -808,7 +809,7 @@ def main():
         print(f"  🔍 State dict keys sample: {list(state.keys())[:10]}")
     
     # Build model via adapter - always use multilabel classifier (includes DR class)
-    num_classes = len(label_columns)
+        num_classes = len(label_columns)
     
     model_name_lower = args.model_name.lower()
     
@@ -820,7 +821,7 @@ def main():
     elif "siglip" in model_name_lower:
         adapter = SigLIPAdapter(model_name_lower, num_classes, label_columns)
     elif model_name_lower in REGISTRY:
-        adapter = REGISTRY[model_name_lower](num_classes)
+            adapter = REGISTRY[model_name_lower](num_classes)
     else:
         raise ValueError(f"Unknown model: {args.model_name}. Available: {list(REGISTRY.keys())}")
 
@@ -1036,7 +1037,7 @@ def main():
     all_probs = torch.sigmoid(all_logits).numpy()
     
     print(f"✅ Inference complete: {all_probs.shape[0]} images, {all_probs.shape[1]} classes.")
-    
+
     # Scores for endpoints (DR-only for Messidor-2)
     # Always use DR head from multilabel classifier with RFMiD threshold
     print(f"  Using DR head from multilabel classifier for Messidor-2 (DR-only dataset)")
