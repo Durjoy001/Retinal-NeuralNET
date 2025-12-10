@@ -74,10 +74,10 @@ bars1 = ax.bar(
     x - width/2,
     binary_sensitivity,
     width,
-    label='Any abnormal vs normal binary screening',
-    color='#1E88E5',          # brighter blue
+    label='Binary screening task',
+    color='#B0B0B0',          # lighter grey
     alpha=1.0,
-    edgecolor='#0D47A1',      # darker blue edge for contrast
+    edgecolor='#909090',      # darker grey edge for contrast
     linewidth=1.2
 )
 
@@ -86,9 +86,9 @@ bars2 = ax.bar(
     multiclass_sensitivity,
     width,
     label='Multi label classification',
-    color='#43A047',          # brighter green
+    color='#505050',          # dark grey
     alpha=1.0,
-    edgecolor='#1B5E20',      # darker green edge
+    edgecolor='#303030',      # darker grey edge
     linewidth=1.2
 )
 

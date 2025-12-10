@@ -32,10 +32,10 @@ x = np.arange(len(models))
 width = 0.35  # Width of the bars
 
 # Create bars
-bars1 = ax.bar(x - width/2, binary_auc, width, label='Any abnormal vs normal binary screening (AUC)', 
-               color='#1E88E5', alpha=1.0, edgecolor='#0D47A1', linewidth=1.2)
+bars1 = ax.bar(x - width/2, binary_auc, width, label='Binary screening task(AUC)', 
+               color='#B0B0B0', alpha=1.0, edgecolor='#909090', linewidth=1.2)
 bars2 = ax.bar(x + width/2, multilevel_auc, width, label='Multi label classification (AUCmacro)', 
-               color='#43A047', alpha=1.0, edgecolor='#1B5E20', linewidth=1.2)
+               color='#505050', alpha=1.0, edgecolor='#303030', linewidth=1.2)
 
 # Customize the plot
 ax.set_xlabel('', fontsize=14, fontweight='bold')
